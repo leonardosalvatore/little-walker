@@ -1,0 +1,8 @@
+# Use Kconfig for LVGL configuration (no lv_conf.h needed)
+CONFIG_LV_CONF_SKIP=y
+
+# FreeRTOS tick rate for smooth LVGL timer resolution
+CONFIG_FREERTOS_HZ=1000
+
+# Flash size for ESP32-C6-LCD-1.47
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y

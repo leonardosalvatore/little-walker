@@ -4,9 +4,26 @@ ESP32-C6 firmware that drives **two hobby servos** (via the on-chip LEDC/PWM)
 and **two DC motors** (via a Pololu **Motoron M3T453** triple I2C motor
 controller), while showing live status on the on-board 1.47" LCD.
 
-The display shows a `Motor Demo` title, the firmware version, and a 2x2 grid of
-status tiles (Left Servo, Right Servo, Left Motor, Right Motor). The demo loops
-through this sequence, highlighting the active tile:
+![Little Walker build: ESP32-C6-LCD-1.47 and Motoron M3T453 on a perfboard chassis between two geared wheels, the LCD showing the robot face](assets/little-walker-build.png)
+
+The build above uses:
+
+- **Waveshare** ESP32-C6-LCD-1.47 development board (MCU + display)
+- **Pololu** Motoron M3T453 triple I2C motor controller
+- 2x geared DC motors with 65 mm wheels
+- A green prototyping/perfboard as the chassis and wiring base
+
+See [Components](#components) for full specifications.
+
+The display is split in two halves:
+
+- **Top (~50%): an animated robot face** — two eyes that change expression as the
+  demo runs (see [Robot face](#robot-face)).
+- **Bottom (~50%): a 2x2 grid of status tiles** (Left Servo, Right Servo, Left
+  Motor, Right Motor), highlighting the active one in blue. The firmware version
+  is shown dimly in the face panel's corner.
+
+The demo loops through this sequence, highlighting the active tile:
 
 ```
 Left Servo : 0  -> 90 -> 180
@@ -126,6 +143,26 @@ Right Motor: Fwd -> Stop -> Back -> Stop
 - Keep motor (VIN) wiring on its own rail away from the logic rail; only the
   ground is shared.
 
+## Robot face
+
+The top panel renders two cyan rounded-rect eyes. Each eye is carved by two
+background-coloured "eyelids" (top + bottom) that resize/rotate to form an
+expression; some expressions also show a small text cue and a round black pupil.
+
+| Expression | Eyes                              | Pupil | Text cue |
+| ---------- | --------------------------------- | ----- | -------- |
+| `sleep`    | thin bottom slit                  | no    | `z Z z`  |
+| `surprise` | wide open                         | yes   | —        |
+| `idle`     | short, centred band               | yes   | —        |
+| `sad`      | slanted `/ \` (inner corners up)  | no    | —        |
+| `happy`    | upward dome                       | no    | `Ahah`   |
+| `furious`  | slanted `\ /` (inner corners down)| no    | `Grrr!`  |
+
+The current expression is also printed to the serial log (`Expression: <name>`).
+`demo_task` maps a face to each phase: `idle`/`surprise` while resting, `sleep`
+during the left servo sweep, `furious` for the left motor, `sad` for the right
+servo sweep, and `happy` for the right motor.
+
 ## Firmware behaviour
 
 On boot the firmware:
@@ -134,8 +171,10 @@ On boot the firmware:
 2. Initializes the Motoron over I2C: `Reinitialize`, `Disable CRC`,
    `Clear reset flag`, and clears the Error mask so the 1.5 s command-timeout
    does not stop the motors during the servo phases.
-3. Brings up the LCD + LVGL and draws the 2x2 status grid.
-4. Runs `demo_task`, stepping through the sequence above (~800 ms per step).
+3. Brings up the LCD + LVGL and draws the robot face (top) and 2x2 status grid
+   (bottom).
+4. Runs `demo_task`, stepping through the sequence above (~800 ms per step) and
+   updating the face expression for each phase.
 
 Motor speed is set by `MOTOR_SPEED` in `main/main.c` (0–800; default 400 for a
 gentle demo). Forward = `+MOTOR_SPEED`, Back = `-MOTOR_SPEED`, Stop = `0`.
@@ -173,3 +212,78 @@ I (7821) main: Right servo: 180
 If the scan instead prints `no I2C devices found` or `Motoron NOT found at
 address 16`, check the Motoron VDD/GND/SDA/SCL wiring, the common ground, and
 that the controller is using its default address (16).
+
+## Components
+
+### Waveshare ESP32-C6-LCD-1.47
+
+Waveshare ESP32-C6 development board with an integrated 1.47" TFT-LCD display.
+The board is suitable for IoT projects, dashboards, and other applications that
+need a graphical user interface. It supports **LVGL** (Light and Versatile
+Graphics Library), an open-source library for building custom GUIs that also
+handles input devices such as a mouse, buttons, etc.
+
+| Spec            | Detail                                                              |
+| --------------- | ------------------------------------------------------------------- |
+| MCU             | ESP32-C6FH4 — 32-bit RISC-V, 160 MHz                                |
+| SRAM            | 512 kB HP + 16 kB LP SRAM                                           |
+| ROM             | 320 kB                                                              |
+| Flash           | 4 MB                                                                |
+| Wireless        | 2.4 GHz Wi-Fi 6 (802.11 b/g/n/ax) and Bluetooth 5 (LE)             |
+| Antenna         | Integrated                                                          |
+| Display         | 1.47" TFT-LCD, 172 × 320 px, 262k colors, SPI interface            |
+| Connection      | USB-C port for power and programming                                |
+| GPIO            | 2× 9-pin headers (not pre-soldered): 13 GPIOs with UART, I²C, PWM, 6 ADC channels, plus 5 V / 3.3 V / GND |
+| Card slot       | MicroSD (offline image/data storage)                                |
+| Buttons         | Reset and Boot                                                      |
+| Dimensions      | approx. 36.4 × 20.3 mm                                              |
+| Dev environments| ESP-IDF, Arduino IDE, CircuitPython                                 |
+| Model           | Waveshare ESP32-C6-LCD-1.47                                         |
+
+### Pololu Motoron M3T453 Triple I²C Motor Controller
+
+An I²C-controlled motor controller for up to three DC motors. Each motor is
+controlled independently, and multiple Motoron controllers can share the same
+I²C bus for systems with more motors. Supplied without pin headers.
+
+| Spec                     | Detail                                       |
+| ------------------------ | -------------------------------------------- |
+| Product                  | Motoron M3T453 Triple I2C Motor Controller   |
+| Motors                   | Up to 3 DC motors                            |
+| Interface                | I2C                                          |
+| I2C clock frequency      | Up to 400 kHz                                |
+| Motor voltage            | 4.5 to 44 V                                  |
+| Current rating           | 0.8 A continuous per motor                   |
+| Peak current             | 2 A per motor for < 1 s                      |
+| Logic voltage            | 3.0 to 5.5 V                                 |
+| PWM frequency            | 1 to 80 kHz                                  |
+| Current sensing          | Motor channels 1 and 2                       |
+| Reverse voltage protection| Down to −40 V on motor power supply         |
+| Connections              | 2.54 mm pitch                                |
+| Pin headers              | Not included                                 |
+| Dimensions               | 17.8 × 22.9 mm                               |
+
+### Geared DC motors with wheels (x2)
+
+| Spec               | Detail                                              |
+| ------------------ | --------------------------------------------------- |
+| Supply voltage     | 3–9 V DC (optimal approx. 5 V)                      |
+| Current (no-load)  | 160–200 mA depending on supply voltage              |
+| Speed (no-load)    | 90–300 rpm (±10 %) depending on supply voltage      |
+| Torque             | 800–1200 gf·cm depending on supply voltage          |
+| Shaft              | 3.6 mm double shaft with 1.9 mm opening             |
+| Wheel diameter     | 65 mm                                               |
+| Wheel width        | 27 mm                                               |
+| Motor dimensions   | 37.6 × 64.2 × 22.5 mm                               |
+| Weight             | approx. 58 g                                        |
+
+### Prototyping/perfboard chassis
+
+The green board the electronics are mounted on is a **prototyping perfboard**
+(also called a "perfboard", "protoboard", or solder-able experiment board): an
+epoxy/FR-4 board with a grid of 2.54 mm-pitch plated through-holes. Unlike a
+solderless breadboard, components and wires are **soldered** to the pads, giving
+a permanent, vibration-resistant build — handy here since the board doubles as
+the robot chassis carrying the two geared wheels and the USB-C cable. Each hole
+is an isolated pad, so all connections between the ESP32-C6, Motoron, motors, and
+power are made with soldered wire links on the underside.
