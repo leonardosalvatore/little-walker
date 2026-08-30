@@ -1,8 +1,9 @@
-# Little Walker — Motor Demo
+# Little Walker
 
-ESP32-C6 firmware that drives **two hobby servos** (via the on-chip LEDC/PWM)
-and **two DC motors** (via a Pololu **Motoron M3T453** triple I2C motor
-controller), while showing live status on the on-board 1.47" LCD.
+ESP32-C6 firmware for a small two-wheeled robot. It drives **two DC motors**
+(via a Pololu **Motoron M3T453** triple I2C motor controller) and **two hobby
+servos** (on-chip LEDC/PWM), reacts to a **VL53L1X** lidar and an **LSM303AGR**
+accelerometer/magnetometer, and shows live status on the on-board 1.47" LCD.
 
 ![Little Walker build: ESP32-C6-LCD-1.47 and Motoron M3T453 on a perfboard chassis between two geared wheels, the LCD showing the robot face](assets/little-walker-build.png)
 
@@ -18,7 +19,7 @@ See [Components](#components) for full specifications.
 The display is split in two halves:
 
 - **Top (~50%): an animated robot face** — two half-height eyes that change
-  expression as the demo runs (see [Robot face](#robot-face)).
+  expression as the robot behaves (see [Robot face](#robot-face)).
 - **Bottom (~50%): a 2x2 grid of status tiles** (Left Servo, Right Servo, Left
   Motor, Right Motor), highlighting the active one in blue, with a **sensor
   readout strip** beneath it (lidar distance, accelerometer, magnetometer). The
@@ -27,14 +28,40 @@ The display is split in two halves:
 The whole UI is rotated 180° (the ST7789 is mounted `mirror_x`/`mirror_y`) so the
 board can sit inverted on the chassis.
 
-The demo loops through this sequence, highlighting the active tile:
+### Reactive behaviour
+
+The robot runs a small sense-act loop (`behave_task` in `main/main.c`) instead of
+a fixed script:
 
 ```
-Left Servo : 0  -> 90 -> 180
-Left Motor : Fwd -> Stop -> Back -> Stop
-Right Servo: 0  -> 90 -> 180
-Right Motor: Fwd -> Stop -> Back -> Stop
+             +-------------------+
+             |  read lidar (mm)  |
+             +-------------------+
+                       |
+        distance > 200 mm? --------- no ---------+
+                       | yes                     |
+              drive both wheels FWD       stop, LOOK left/right
+                       |                  (sweep servos 20/160)
+          accel jitter >= threshold?             |
+             |                 |          turn toward the
+            yes                no          more-open side,
+          keep rolling      "STUCK":       then re-check
+          (happy face)     stop + furious  (sad -> surprise)
 ```
+
+- **Walk toward open space:** while the lidar reads more than `LIDAR_STOP_MM`
+  (200 mm) ahead, both wheels drive forward.
+- **Look left and right:** when something comes within 200 mm, the robot stops,
+  sweeps the servos to ~20° and ~160° while sampling the lidar, then turns in
+  place toward whichever side is more open until the path reopens past
+  `LIDAR_CLEAR_MM` (300 mm).
+- **Wheel-motion check:** while driving forward it watches accelerometer
+  "jitter"; if the wheels are commanded to move but the accel stays too still
+  (below `STALL_G_THRESH`), it flags `STUCK`, stops, and shows the furious face.
+  The measured jitter is logged each forward burst so the threshold is easy to
+  tune for your surface.
+
+Thresholds are `#define`s at the top of `main/main.c`.
 
 ## Hardware
 
@@ -182,9 +209,9 @@ expression; some expressions also show a small text cue and a round black pupil.
 | `furious`  | slanted `\ /` (inner corners down)| no    | `Grrr!`  |
 
 The current expression is also printed to the serial log (`Expression: <name>`).
-`demo_task` maps a face to each phase: `idle`/`surprise` while resting, `sleep`
-during the left servo sweep, `furious` for the left motor, `sad` for the right
-servo sweep, and `happy` for the right motor.
+`behave_task` maps a face to each behaviour: `happy` while driving forward,
+`surprise` when an obstacle is detected within 200 mm, `sad` while scanning and
+turning, and `furious` when the wheels appear stuck.
 
 ## Firmware behaviour
 
@@ -198,12 +225,11 @@ On boot the firmware:
    bus; any that are missing are skipped and shown as `--`.
 4. Brings up the LCD + LVGL (rotated 180°) and draws the robot face (top), the
    2x2 status grid, and the sensor readout strip (bottom).
-5. Runs `demo_task`, stepping through the sequence above (~800 ms per step) and
-   updating the face expression for each phase, plus `sensor_task` refreshing the
-   lidar/accel/mag readout ~10 Hz.
+5. Runs `sensor_task` (lidar/accel/mag readout ~10 Hz) and `behave_task` (the
+   reactive sense-act loop described in [Reactive behaviour](#reactive-behaviour)).
 
-Motor speed is set by `MOTOR_SPEED` in `main/main.c` (0–800; default 400 for a
-gentle demo). Forward = `+MOTOR_SPEED`, Back = `-MOTOR_SPEED`, Stop = `0`.
+Motor speed is set by `MOTOR_SPEED` in `main/main.c` (0–800; default 400 for
+gentle motion). Forward = `+MOTOR_SPEED`, Back = `-MOTOR_SPEED`, Stop = `0`.
 
 ## Build & flash
 
@@ -215,24 +241,22 @@ idf.py -p /dev/ttyACM0 flash monitor
 
 ## Example boot log
 
-On a correctly wired board the startup I2C scan finds the Motoron at address
-`0x10` and the demo begins stepping through the servo/motor sequence:
+On a correctly wired board the startup I2C scan names every device on the bus and
+the reactive behaviour loop starts:
 
 ```
-I (333) main: Servos initialized: LEFT=GPIO0 (TIMER0) RIGHT=GPIO1 (TIMER1)
-I (340) main: Initializing Motoron motor controller...
-I (345) main: Scanning I2C bus (SDA=GPIO4 SCL=GPIO5)...
-I (351) main:   found I2C device at 0x10 (16)
-I (367) main: Motoron present at address 16.
-I (374) main: Motoron initialized on I2C SDA=GPIO4 SCL=GPIO5 addr=16
-I (518) main: Display initialized. Setting up LVGL...
-I (607) main: UI ready. Starting motor demo...
-I (607) main: Left servo: 0
-I (1409) main: Left servo: 90
-I (2210) main: Left servo: 180
-I (6219) main: Right servo: 0
-I (7020) main: Right servo: 90
-I (7821) main: Right servo: 180
+I (352) main: Scanning I2C bus (SDA=GPIO4 SCL=GPIO5)...
+I (352) main:   found I2C device at 0x10 (16) - Motoron M3T453
+I (357) main:   found I2C device at 0x19 (25) - LSM303AGR accel
+I (362) main:   found I2C device at 0x1E (30) - LSM303AGR mag
+I (368) main:   found I2C device at 0x29 (41) - VL53L1X lidar
+I (390) main: Motoron initialized on I2C SDA=GPIO4 SCL=GPIO5 addr=16
+I (405) vl53l1x: VL53L1X ranging started at 0x29
+I (405) main: Sensors: lidar=1 accel=1 mag=1
+I (661) main: UI ready. Starting reactive behaviour...
+I (670) main: Obstacle at 154 mm - scanning
+I (1680) main: Scan L=160 R=158 -> turn left
+I (3532) main: Rolling: dist=812 mm jitter=0.061 g
 ```
 
 If the scan instead prints `no I2C devices found` or `Motoron NOT found at

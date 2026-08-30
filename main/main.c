@@ -13,6 +13,7 @@
 #include "esp_log.h"
 #include "esp_app_desc.h"
 #include "vl53l1x.h"
+#include <math.h>
 
 static const char *TAG = "main";
 
@@ -39,6 +40,12 @@ static const char *TAG = "main";
 #define MOTOR_LEFT_CH   1     // Motoron motor channel 1
 #define MOTOR_RIGHT_CH  2     // Motoron motor channel 2
 #define MOTOR_SPEED     400   // 0..800 (half power for a gentle demo)
+
+// Reactive-behaviour tuning
+#define LIDAR_STOP_MM   200   // obstacle distance that halts forward driving
+#define LIDAR_CLEAR_MM  300   // path must reopen past this before resuming
+#define LIDAR_MAX_MM    4000  // readings above this (or 0) are treated invalid
+#define STALL_G_THRESH  0.04f // min accel jitter (g) expected while rolling
 
 // Servo PWM parameters (50 Hz, 14-bit resolution)
 #define SERVO_FREQ_HZ       50
@@ -413,22 +420,16 @@ static void set_tile(tile_id_t tile, const char *text, bool active)
         LV_PART_MAIN);
 }
 
-#define STEP_MS 800
-
-static void demo_delay(void)
+// Update all four status tiles at once (servo angles + motor states)
+static void ui_set_tiles(const char *ls, const char *rs,
+                         const char *lm, const char *rm,
+                         bool ls_a, bool rs_a, bool lm_a, bool rm_a)
 {
-    vTaskDelay(pdMS_TO_TICKS(STEP_MS));
-}
-
-// Update one tile (active) and reset the others to idle, holding their last text
-static void show_active(tile_id_t active, const char *text)
-{
-    static const char *last[TILE_COUNT] = {"--", "--", "--", "--"};
-    last[active] = text;
     if (lvgl_port_lock(0)) {
-        for (int i = 0; i < TILE_COUNT; i++) {
-            set_tile((tile_id_t)i, last[i], i == active);
-        }
+        set_tile(TILE_LSERVO, ls, ls_a);
+        set_tile(TILE_RSERVO, rs, rs_a);
+        set_tile(TILE_LMOTOR, lm, lm_a);
+        set_tile(TILE_RMOTOR, rm, rm_a);
         lvgl_port_unlock();
     }
 }
@@ -552,51 +553,135 @@ static void show_face(face_expr_t e)
     }
 }
 
-static void demo_task(void *arg)
+// Current lidar distance in mm, or 0 when there is no valid reading
+static uint16_t lidar_mm_now(void)
 {
+    if (!s_have_lidar) {
+        return 0;
+    }
+    uint16_t d = s_lidar_mm;
+    if (d == 0 || d > LIDAR_MAX_MM) {
+        return 0;
+    }
+    return d;
+}
+
+// Magnitude of the accelerometer vector (~1 g at rest)
+static float accel_mag(void)
+{
+    return sqrtf(s_acc_g[0] * s_acc_g[0] +
+                 s_acc_g[1] * s_acc_g[1] +
+                 s_acc_g[2] * s_acc_g[2]);
+}
+
+// Point both servos to an angle as a "look" gesture and reflect it on the tiles
+static void look(int angle)
+{
+    servo_set_angle(LEDC_CHANNEL_0, angle);
+    servo_set_angle(LEDC_CHANNEL_1, angle);
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d\xC2\xB0", angle);
+    ui_set_tiles(buf, buf, "--", "--", true, true, false, false);
+}
+
+// Accumulate accel "jitter" over ~600 ms. While the robot is really rolling this
+// picks up vibration/tilt; near-zero while driving means the wheels are stuck.
+static float measure_movement(void)
+{
+    if (!s_have_accel) {
+        return 1.0f;   // no accelerometer -> assume motion is fine
+    }
+    float prev = accel_mag();
+    float total = 0.0f;
+    for (int i = 0; i < 6; i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        float m = accel_mag();
+        total += fabsf(m - prev);
+        prev = m;
+    }
+    return total;
+}
+
+// Reactive behaviour: drive forward while the path is clear; when something is
+// within LIDAR_STOP_MM, stop, look left/right, and turn toward the opener side.
+// The accelerometer confirms the wheels are actually moving while driving.
+static void behave_task(void *arg)
+{
+    look(90);   // center the head
+
     while (1) {
-        // Resting beats
-        show_face(FACE_IDLE);
-        demo_delay();
-        show_face(FACE_SURPRISE);
-        demo_delay();
+        uint16_t d = lidar_mm_now();
 
-        // Left servo: 0 -> 90 -> 180
-        show_face(FACE_SLEEP);
-        const int angles[] = {0, 90, 180};
-        for (int i = 0; i < 3; i++) {
-            char buf[8];
-            snprintf(buf, sizeof(buf), "%d\xC2\xB0", angles[i]);
-            servo_set_angle(LEDC_CHANNEL_0, angles[i]);
-            ESP_LOGI(TAG, "Left servo: %d", angles[i]);
-            show_active(TILE_LSERVO, buf);
-            demo_delay();
+        if (d != 0 && d <= LIDAR_STOP_MM) {
+            // Obstacle within 200 mm: stop and look left / right
+            motor_stop(MOTOR_LEFT_CH);
+            motor_stop(MOTOR_RIGHT_CH);
+            show_face(FACE_SURPRISE);
+            ESP_LOGI(TAG, "Obstacle at %u mm - scanning", d);
+
+            look(20);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            uint16_t left = lidar_mm_now();
+            look(160);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            uint16_t right = lidar_mm_now();
+            look(90);
+
+            // Turn in place toward whichever side looked more open
+            bool go_left = (left >= right);
+            show_face(FACE_SAD);
+            ESP_LOGI(TAG, "Scan L=%u R=%u -> turn %s",
+                     left, right, go_left ? "left" : "right");
+            if (go_left) {
+                motor_back(MOTOR_LEFT_CH);
+                motor_fwd(MOTOR_RIGHT_CH);
+                ui_set_tiles("90\xC2\xB0", "90\xC2\xB0", "Rev", "Fwd",
+                             false, false, true, true);
+            } else {
+                motor_fwd(MOTOR_LEFT_CH);
+                motor_back(MOTOR_RIGHT_CH);
+                ui_set_tiles("90\xC2\xB0", "90\xC2\xB0", "Fwd", "Rev",
+                             false, false, true, true);
+            }
+
+            // Rotate until the path ahead reopens (or ~1.8 s timeout)
+            for (int t = 0; t < 12; t++) {
+                vTaskDelay(pdMS_TO_TICKS(150));
+                uint16_t dd = lidar_mm_now();
+                if (dd == 0 || dd >= LIDAR_CLEAR_MM) {
+                    break;
+                }
+            }
+            motor_stop(MOTOR_LEFT_CH);
+            motor_stop(MOTOR_RIGHT_CH);
+            continue;
         }
 
-        // Left motor: Fwd -> Stop -> Back -> Stop
-        show_face(FACE_FURIOUS);
-        motor_fwd(MOTOR_LEFT_CH);  show_active(TILE_LMOTOR, "Fwd");  demo_delay();
-        motor_stop(MOTOR_LEFT_CH); show_active(TILE_LMOTOR, "Stop"); demo_delay();
-        motor_back(MOTOR_LEFT_CH); show_active(TILE_LMOTOR, "Back"); demo_delay();
-        motor_stop(MOTOR_LEFT_CH); show_active(TILE_LMOTOR, "Stop"); demo_delay();
-
-        // Right servo: 0 -> 90 -> 180
-        show_face(FACE_SAD);
-        for (int i = 0; i < 3; i++) {
-            char buf[8];
-            snprintf(buf, sizeof(buf), "%d\xC2\xB0", angles[i]);
-            servo_set_angle(LEDC_CHANNEL_1, angles[i]);
-            ESP_LOGI(TAG, "Right servo: %d", angles[i]);
-            show_active(TILE_RSERVO, buf);
-            demo_delay();
-        }
-
-        // Right motor: Fwd -> Stop -> Back -> Stop
+        // Path clear: walk forward
         show_face(FACE_HAPPY);
-        motor_fwd(MOTOR_RIGHT_CH);  show_active(TILE_RMOTOR, "Fwd");  demo_delay();
-        motor_stop(MOTOR_RIGHT_CH); show_active(TILE_RMOTOR, "Stop"); demo_delay();
-        motor_back(MOTOR_RIGHT_CH); show_active(TILE_RMOTOR, "Back"); demo_delay();
-        motor_stop(MOTOR_RIGHT_CH); show_active(TILE_RMOTOR, "Stop"); demo_delay();
+        motor_fwd(MOTOR_LEFT_CH);
+        motor_fwd(MOTOR_RIGHT_CH);
+        ui_set_tiles("90\xC2\xB0", "90\xC2\xB0", "Fwd", "Fwd",
+                     false, false, true, true);
+
+        // Confirm we are actually rolling via the accelerometer
+        float moved = measure_movement();
+        uint16_t d2 = lidar_mm_now();
+        if (d2 != 0 && d2 <= LIDAR_STOP_MM) {
+            continue;   // obstacle appeared while driving - handle it next loop
+        }
+        if (s_have_accel && moved < STALL_G_THRESH) {
+            ESP_LOGW(TAG, "Wheels not moving (jitter %.3f g < %.3f) - stuck?",
+                     moved, (float)STALL_G_THRESH);
+            show_face(FACE_FURIOUS);
+            motor_stop(MOTOR_LEFT_CH);
+            motor_stop(MOTOR_RIGHT_CH);
+            ui_set_tiles("90\xC2\xB0", "90\xC2\xB0", "STUCK", "STUCK",
+                         false, false, true, true);
+            vTaskDelay(pdMS_TO_TICKS(800));
+        } else {
+            ESP_LOGI(TAG, "Rolling: dist=%u mm jitter=%.3f g", d2, moved);
+        }
     }
 }
 
@@ -906,7 +991,7 @@ void app_main(void)
         lvgl_port_unlock();
     }
 
-    ESP_LOGI(TAG, "UI ready. Starting motor demo...");
-    xTaskCreate(demo_task, "demo", 3072, NULL, 5, NULL);
-    xTaskCreate(sensor_task, "sensors", 4096, NULL, 4, NULL);
+    ESP_LOGI(TAG, "UI ready. Starting reactive behaviour...");
+    xTaskCreate(sensor_task, "sensors", 4096, NULL, 5, NULL);
+    xTaskCreate(behave_task, "behave", 4096, NULL, 4, NULL);
 }
