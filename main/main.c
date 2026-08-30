@@ -12,6 +12,7 @@
 #include "lvgl.h"
 #include "esp_log.h"
 #include "esp_app_desc.h"
+#include "vl53l1x.h"
 
 static const char *TAG = "main";
 
@@ -31,6 +32,10 @@ static const char *TAG = "main";
 #define PIN_I2C_SDA     4
 #define PIN_I2C_SCL     5
 #define MOTORON_ADDR    16    // default 7-bit I2C address
+
+// Qwiic sensors sharing the same I2C bus (GPIO4/5)
+#define LSM303_ACC_ADDR 0x19  // LSM303AGR accelerometer
+#define LSM303_MAG_ADDR 0x1E  // LSM303AGR magnetometer
 #define MOTOR_LEFT_CH   1     // Motoron motor channel 1
 #define MOTOR_RIGHT_CH  2     // Motoron motor channel 2
 #define MOTOR_SPEED     400   // 0..800 (half power for a gentle demo)
@@ -198,7 +203,15 @@ static void motoron_scan(void)
     int found = 0;
     for (uint8_t addr = 0x08; addr < 0x78; addr++) {
         if (i2c_master_probe(s_i2c_bus, addr, 50) == ESP_OK) {
-            ESP_LOGI(TAG, "  found I2C device at 0x%02X (%d)", addr, addr);
+            const char *name = "?";
+            switch (addr) {
+            case MOTORON_ADDR:      name = "Motoron M3T453";       break;
+            case LSM303_ACC_ADDR:   name = "LSM303AGR accel";      break;
+            case LSM303_MAG_ADDR:   name = "LSM303AGR mag";        break;
+            case VL53L1X_I2C_ADDR:  name = "VL53L1X lidar";        break;
+            default:                                               break;
+            }
+            ESP_LOGI(TAG, "  found I2C device at 0x%02X (%d) - %s", addr, addr, name);
             found++;
         }
     }
@@ -265,6 +278,108 @@ static inline void motor_fwd(uint8_t motor)  { motoron_set_speed(motor, MOTOR_SP
 static inline void motor_stop(uint8_t motor) { motoron_set_speed(motor, 0); }
 static inline void motor_back(uint8_t motor) { motoron_set_speed(motor, -MOTOR_SPEED); }
 
+// --- Qwiic sensors: LSM303AGR (accel + mag) and VL53L1X (lidar) ---
+static i2c_master_dev_handle_t s_lsm_acc = NULL;
+static i2c_master_dev_handle_t s_lsm_mag = NULL;
+static vl53l1x_t s_lidar;
+
+static bool s_have_accel = false;
+static bool s_have_mag = false;
+static bool s_have_lidar = false;
+
+// Latest readings, shared with the UI (only the sensor task writes them)
+static uint16_t s_lidar_mm = 0;
+static float s_acc_g[3] = {0};
+static float s_mag_ut[3] = {0};
+
+static esp_err_t lsm_write8(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t val)
+{
+    uint8_t buf[2] = { reg, val };
+    return i2c_master_transmit(dev, buf, sizeof(buf), 100);
+}
+
+// Read n bytes. The accelerometer needs the auto-increment bit (0x80) set on the
+// sub-address; the magnetometer auto-increments on its own.
+static esp_err_t lsm_read(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t *buf, size_t n)
+{
+    return i2c_master_transmit_receive(dev, &reg, 1, buf, n, 100);
+}
+
+static bool lsm303_init(void)
+{
+    i2c_device_config_t acc_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = LSM303_ACC_ADDR,
+        .scl_speed_hz = 100000,
+    };
+    i2c_device_config_t mag_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = LSM303_MAG_ADDR,
+        .scl_speed_hz = 100000,
+    };
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(s_i2c_bus, &acc_cfg, &s_lsm_acc));
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(s_i2c_bus, &mag_cfg, &s_lsm_mag));
+
+    uint8_t who = 0;
+    // Accelerometer: WHO_AM_I_A (0x0F) == 0x33; enable XYZ @ 100 Hz, ±2 g
+    if (lsm_read(s_lsm_acc, 0x0F, &who, 1) == ESP_OK && who == 0x33) {
+        lsm_write8(s_lsm_acc, 0x20, 0x57);   // CTRL_REG1_A: 100 Hz, XYZ enabled
+        lsm_write8(s_lsm_acc, 0x23, 0x00);   // CTRL_REG4_A: ±2 g, normal mode
+        s_have_accel = true;
+    } else {
+        ESP_LOGW(TAG, "LSM303AGR accel not found at 0x%02X", LSM303_ACC_ADDR);
+    }
+
+    // Magnetometer: WHO_AM_I_M (0x4F) == 0x40; continuous mode, temp comp
+    who = 0;
+    if (lsm_read(s_lsm_mag, 0x4F, &who, 1) == ESP_OK && who == 0x40) {
+        lsm_write8(s_lsm_mag, 0x60, 0x80);   // CFG_REG_A_M: continuous, temp comp
+        s_have_mag = true;
+    } else {
+        ESP_LOGW(TAG, "LSM303AGR mag not found at 0x%02X", LSM303_MAG_ADDR);
+    }
+
+    return s_have_accel || s_have_mag;
+}
+
+static void lsm303_read_accel(void)
+{
+    uint8_t b[6];
+    if (lsm_read(s_lsm_acc, 0x28 | 0x80, b, sizeof(b)) != ESP_OK) {
+        return;
+    }
+    // Normal mode: 10-bit left-justified; ±2 g -> 3.9 mg per LSB
+    for (int i = 0; i < 3; i++) {
+        int16_t raw = (int16_t)((uint16_t)b[2 * i] | ((uint16_t)b[2 * i + 1] << 8));
+        s_acc_g[i] = (raw >> 6) * 0.0039f;
+    }
+}
+
+static void lsm303_read_mag(void)
+{
+    uint8_t b[6];
+    if (lsm_read(s_lsm_mag, 0x68, b, sizeof(b)) != ESP_OK) {
+        return;
+    }
+    // LSM303AGR magnetometer: 1.5 mgauss per LSB -> 0.15 uT per LSB
+    for (int i = 0; i < 3; i++) {
+        int16_t raw = (int16_t)((uint16_t)b[2 * i] | ((uint16_t)b[2 * i + 1] << 8));
+        s_mag_ut[i] = raw * 0.15f;
+    }
+}
+
+static void sensors_init(void)
+{
+    lsm303_init();
+    if (vl53l1x_init(s_i2c_bus, &s_lidar) == ESP_OK) {
+        s_have_lidar = true;
+    } else {
+        ESP_LOGW(TAG, "VL53L1X lidar not available");
+    }
+    ESP_LOGI(TAG, "Sensors: lidar=%d accel=%d mag=%d",
+             s_have_lidar, s_have_accel, s_have_mag);
+}
+
 // --- LVGL status tiles (2x2 grid) ---
 typedef enum {
     TILE_LSERVO = 0,
@@ -276,6 +391,9 @@ typedef enum {
 
 static lv_obj_t *tile_panel[TILE_COUNT];
 static lv_obj_t *tile_value[TILE_COUNT];
+
+// Full-width sensor readout below the 2x2 grid (lidar / accel / mag)
+static lv_obj_t *s_sensor_label = NULL;
 
 // Update a tile's value text and highlight it as active (blue) or idle (dark)
 static void set_tile(tile_id_t tile, const char *text, bool active)
@@ -326,7 +444,7 @@ typedef enum {
 } face_expr_t;
 
 #define EYE_W 48
-#define EYE_H 62
+#define EYE_H 31        // half-height eyes
 #define EYE_SLANT 240   // slant angle for sad/furious eyes (0.1 deg units)
 #define FACE_BG lv_color_make(0x05, 0x07, 0x0D)
 
@@ -369,26 +487,32 @@ static void set_face(face_expr_t e)
         set_lid(top, LV_OPA_TRANSP, EYE_W, EYE_H, 0, 0, 0);
         set_lid(bot, LV_OPA_TRANSP, EYE_W, EYE_H, 0, 0, 0);
 
+        // Geometry scales with EYE_H so expressions still carve a half-height eye
+        const int band = EYE_H / 3;         // idle top/bottom lid height
+        const int slit = 4;                 // sleep bottom slit
+        const int dome = EYE_H * 2 / 3;     // happy bottom cover height
+        const int slant_y = (EYE_H / 2) - 90;   // slant bar vertical placement
+
         switch (e) {
         case FACE_SURPRISE:             // full open eye
             break;
         case FACE_IDLE:                 // short centred band + pupil
-            set_lid(top, LV_OPA_COVER, EYE_W, 18, 0, 0, 0);
-            set_lid(bot, LV_OPA_COVER, EYE_W, 18, 0, EYE_H - 18, 0);
+            set_lid(top, LV_OPA_COVER, EYE_W, band, 0, 0, 0);
+            set_lid(bot, LV_OPA_COVER, EYE_W, band, 0, EYE_H - band, 0);
             break;
         case FACE_SLEEP:                // cover all but a thin bottom slit
-            set_lid(top, LV_OPA_COVER, EYE_W, EYE_H - 8, 0, 0, 0);
+            set_lid(top, LV_OPA_COVER, EYE_W, EYE_H - slit, 0, 0, 0);
             break;
         case FACE_HAPPY:                // cover bottom -> upward dome
-            set_lid(bot, LV_OPA_COVER, EYE_W, 40, 0, EYE_H - 40, 0);
+            set_lid(bot, LV_OPA_COVER, EYE_W, dome, 0, EYE_H - dome, 0);
             break;
         case FACE_SAD:                  // eyes slant "/ \" (inner corners high)
             set_lid(top, LV_OPA_COVER, EYE_W + 80, 90, (EYE_W - (EYE_W + 80)) / 2,
-                    30 - 90, (i == 0) ? -EYE_SLANT : EYE_SLANT);
+                    slant_y, (i == 0) ? -EYE_SLANT : EYE_SLANT);
             break;
         case FACE_FURIOUS:              // eyes slant "\ /" (inner corners low)
             set_lid(top, LV_OPA_COVER, EYE_W + 80, 90, (EYE_W - (EYE_W + 80)) / 2,
-                    30 - 90, (i == 0) ? EYE_SLANT : -EYE_SLANT);
+                    slant_y, (i == 0) ? EYE_SLANT : -EYE_SLANT);
             break;
         }
     }
@@ -476,6 +600,57 @@ static void demo_task(void *arg)
     }
 }
 
+// Poll the Qwiic sensors and refresh the readout strip (~10 Hz)
+static void sensor_task(void *arg)
+{
+    char buf[128];
+    while (1) {
+        if (s_have_lidar) {
+            uint16_t mm;
+            if (vl53l1x_read_mm(&s_lidar, &mm) == ESP_OK) {
+                s_lidar_mm = mm;
+            }
+        }
+        if (s_have_accel) {
+            lsm303_read_accel();
+        }
+        if (s_have_mag) {
+            lsm303_read_mag();
+        }
+
+        char lidar_line[32];
+        char acc_line[48];
+        char mag_line[48];
+
+        if (s_have_lidar) {
+            snprintf(lidar_line, sizeof(lidar_line), "LIDAR  %u mm", s_lidar_mm);
+        } else {
+            snprintf(lidar_line, sizeof(lidar_line), "LIDAR  --");
+        }
+        if (s_have_accel) {
+            snprintf(acc_line, sizeof(acc_line), "ACC  %+.2f %+.2f %+.2f g",
+                     s_acc_g[0], s_acc_g[1], s_acc_g[2]);
+        } else {
+            snprintf(acc_line, sizeof(acc_line), "ACC  --");
+        }
+        if (s_have_mag) {
+            snprintf(mag_line, sizeof(mag_line), "MAG  %+.1f %+.1f %+.1f uT",
+                     s_mag_ut[0], s_mag_ut[1], s_mag_ut[2]);
+        } else {
+            snprintf(mag_line, sizeof(mag_line), "MAG  --");
+        }
+
+        snprintf(buf, sizeof(buf), "%s\n%s\n%s", lidar_line, acc_line, mag_line);
+
+        if (s_sensor_label && lvgl_port_lock(0)) {
+            lv_label_set_text(s_sensor_label, buf);
+            lvgl_port_unlock();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
 // Create one status tile inside the grid
 static void make_tile(lv_obj_t *parent, tile_id_t id, const char *caption,
                       int w, int h, int x, int y)
@@ -499,7 +674,7 @@ static void make_tile(lv_obj_t *parent, tile_id_t id, const char *caption,
     lv_label_set_text(val, "--");
     lv_obj_set_style_text_color(val, lv_color_make(0xFF, 0xFF, 0x00), LV_PART_MAIN);
     lv_obj_set_style_text_font(val, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_align(val, LV_ALIGN_CENTER, 0, 8);
+    lv_obj_align(val, LV_ALIGN_BOTTOM_MID, 0, -2);
 
     tile_panel[id] = panel;
     tile_value[id] = val;
@@ -514,7 +689,7 @@ static void make_eye(lv_obj_t *parent, int idx, int x_off)
     lv_obj_align(eye, LV_ALIGN_CENTER, x_off, -6);
     lv_obj_set_style_bg_color(eye, lv_color_make(0x33, 0xE1, 0xFF), LV_PART_MAIN);
     lv_obj_set_style_border_width(eye, 0, LV_PART_MAIN);
-    lv_obj_set_style_radius(eye, 18, LV_PART_MAIN);
+    lv_obj_set_style_radius(eye, 10, LV_PART_MAIN);
     lv_obj_set_style_pad_all(eye, 0, LV_PART_MAIN);
     lv_obj_set_style_clip_corner(eye, true, LV_PART_MAIN);
     lv_obj_clear_flag(eye, LV_OBJ_FLAG_SCROLLABLE);
@@ -536,7 +711,7 @@ static void make_eye(lv_obj_t *parent, int idx, int x_off)
         lv_obj_set_pos(lid, 0, 0);
         lv_obj_set_style_bg_color(lid, FACE_BG, LV_PART_MAIN);
         lv_obj_set_style_border_width(lid, 0, LV_PART_MAIN);
-        lv_obj_set_style_radius(lid, 16, LV_PART_MAIN);
+        lv_obj_set_style_radius(lid, 8, LV_PART_MAIN);
         lv_obj_set_style_pad_all(lid, 0, LV_PART_MAIN);
         lv_obj_clear_flag(lid, LV_OBJ_FLAG_SCROLLABLE);
         if (k == 0) {
@@ -611,13 +786,32 @@ static void create_ui(void)
     int inner_w = LCD_H_RES - 8 - 12;
     int inner_h = LCD_V_RES - top_h - 16 - 12;
     int gap = 8;
+    int strip_h = 60;                       // sensor readout strip at the bottom
+    int grid_h = inner_h - strip_h - gap;   // remaining height for the 2x2 grid
     int tw = (inner_w - gap) / 2;
-    int th = (inner_h - gap) / 2;
+    int th = (grid_h - gap) / 2;
 
     make_tile(bottom_panel, TILE_LSERVO, "Left Servo",  tw, th, 0,         0);
     make_tile(bottom_panel, TILE_RSERVO, "Right Servo", tw, th, tw + gap,  0);
     make_tile(bottom_panel, TILE_LMOTOR, "Left Motor",  tw, th, 0,         th + gap);
     make_tile(bottom_panel, TILE_RMOTOR, "Right Motor", tw, th, tw + gap,  th + gap);
+
+    // Sensor readout strip (lidar distance + accelerometer + magnetometer)
+    lv_obj_t *strip = lv_obj_create(bottom_panel);
+    lv_obj_set_size(strip, inner_w, strip_h);
+    lv_obj_set_pos(strip, 0, grid_h + gap);
+    lv_obj_set_style_bg_color(strip, lv_color_make(0x20, 0x20, 0x30), LV_PART_MAIN);
+    lv_obj_set_style_border_width(strip, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(strip, lv_color_make(0x40, 0x40, 0x50), LV_PART_MAIN);
+    lv_obj_set_style_radius(strip, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(strip, 4, LV_PART_MAIN);
+    lv_obj_clear_flag(strip, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_sensor_label = lv_label_create(strip);
+    lv_label_set_text(s_sensor_label, "LIDAR  --\nACC  --\nMAG  --");
+    lv_obj_set_style_text_color(s_sensor_label, lv_color_make(0x33, 0xE1, 0xFF), LV_PART_MAIN);
+    lv_obj_set_style_text_font(s_sensor_label, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_align(s_sensor_label, LV_ALIGN_LEFT_MID, 0, 0);
 
     set_face(FACE_IDLE);
 }
@@ -629,6 +823,9 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Initializing Motoron motor controller...");
     motoron_init();
+
+    ESP_LOGI(TAG, "Initializing Qwiic sensors...");
+    sensors_init();
 
     ESP_LOGI(TAG, "Initializing display...");
 
@@ -691,8 +888,8 @@ void app_main(void)
         .color_format = LV_COLOR_FORMAT_RGB565,
         .rotation = {
             .swap_xy = false,
-            .mirror_x = false,
-            .mirror_y = false,
+            .mirror_x = true,
+            .mirror_y = true,
         },
         .flags = {
             .buff_dma = true,
@@ -711,4 +908,5 @@ void app_main(void)
 
     ESP_LOGI(TAG, "UI ready. Starting motor demo...");
     xTaskCreate(demo_task, "demo", 3072, NULL, 5, NULL);
+    xTaskCreate(sensor_task, "sensors", 4096, NULL, 4, NULL);
 }

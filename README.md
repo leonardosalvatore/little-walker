@@ -17,11 +17,15 @@ See [Components](#components) for full specifications.
 
 The display is split in two halves:
 
-- **Top (~50%): an animated robot face** — two eyes that change expression as the
-  demo runs (see [Robot face](#robot-face)).
+- **Top (~50%): an animated robot face** — two half-height eyes that change
+  expression as the demo runs (see [Robot face](#robot-face)).
 - **Bottom (~50%): a 2x2 grid of status tiles** (Left Servo, Right Servo, Left
-  Motor, Right Motor), highlighting the active one in blue. The firmware version
-  is shown dimly in the face panel's corner.
+  Motor, Right Motor), highlighting the active one in blue, with a **sensor
+  readout strip** beneath it (lidar distance, accelerometer, magnetometer). The
+  firmware version is shown dimly in the face panel's corner.
+
+The whole UI is rotated 180° (the ST7789 is mounted `mirror_x`/`mirror_y`) so the
+board can sit inverted on the chassis.
 
 The demo loops through this sequence, highlighting the active tile:
 
@@ -40,6 +44,8 @@ Right Motor: Fwd -> Stop -> Back -> Stop
 | Motor controller     | Pololu **Motoron M3T453** (triple, I2C, addr `16`/`0x10`)|
 | Motors               | 2x brushed DC motors (4.5–44 V, <= 0.8 A continuous)     |
 | Servos               | 2x standard hobby servos (5 V)                           |
+| Distance sensor      | **VL53L1X** ToF lidar, Qwiic, I2C addr `0x29`            |
+| IMU / compass        | **LSM303AGR** accel+mag, Qwiic, I2C addr `0x19`/`0x1E`   |
 | Logic supply         | USB supply, selectable **3.3 V / 5 V**                   |
 | Motor supply         | USB supply, **0–24 V** adjustable                        |
 | Build base           | Breadboard with two power rails                          |
@@ -52,12 +58,29 @@ Right Motor: Fwd -> Stop -> Back -> Stop
 | LCD CS/DC/RST/BL  | 14/15/21/22 | on-board display                  |
 | Servo LEFT signal | 0      | PWM 50 Hz                              |
 | Servo RIGHT signal| 1      | PWM 50 Hz                              |
-| I2C SDA           | 4      | to Motoron SDA                         |
-| I2C SCL           | 5      | to Motoron SCL                         |
+| I2C SDA           | 4      | to Motoron SDA + Qwiic chain           |
+| I2C SCL           | 5      | to Motoron SCL + Qwiic chain           |
 
 > The I2C pins (GPIO4/5) are defined at the top of `main/main.c`
 > (`PIN_I2C_SDA` / `PIN_I2C_SCL`). Confirm they match a free pad on your board's
 > header silkscreen and change them there if needed.
+
+### Qwiic sensor chain (shared I2C bus)
+
+The **VL53L1X** lidar and **LSM303AGR** accel/magnetometer are daisy-chained over
+Qwiic onto the **same GPIO4/5 I2C bus** as the Motoron (all 3.3 V logic). The
+addresses do not collide:
+
+| Device            | I2C addr        | Product                                                                                                   |
+| ----------------- | --------------- | -------------------------------------------------------------------------------------------------------- |
+| Motoron M3T453    | `0x10`          | motor controller                                                                                          |
+| LSM303AGR         | `0x19` + `0x1E` | [Electrokit 41035585](https://www.electrokit.com/rorelsegivare-och-magnetometer-lsm303agr-qwiic) / [Adafruit 4413](https://www.adafruit.com/product/4413) |
+| VL53L1X           | `0x29`          | [Electrokit 41036424](https://www.electrokit.com/avstandssensor-tof-lidar-30-4000mm-vl53l1x-qwiic)        |
+
+The startup I2C scan names each device it finds. Live lidar distance (mm),
+accelerometer (g), and magnetometer (µT) readings are shown on the LCD in a strip
+below the servo/motor tiles, refreshed ~10 Hz. A missing sensor simply shows `--`
+and does not stop the motor demo.
 
 ## Wiring overview
 
@@ -171,10 +194,13 @@ On boot the firmware:
 2. Initializes the Motoron over I2C: `Reinitialize`, `Disable CRC`,
    `Clear reset flag`, and clears the Error mask so the 1.5 s command-timeout
    does not stop the motors during the servo phases.
-3. Brings up the LCD + LVGL and draws the robot face (top) and 2x2 status grid
-   (bottom).
-4. Runs `demo_task`, stepping through the sequence above (~800 ms per step) and
-   updating the face expression for each phase.
+3. Probes the Qwiic sensors (VL53L1X lidar, LSM303AGR accel/mag) on the same I2C
+   bus; any that are missing are skipped and shown as `--`.
+4. Brings up the LCD + LVGL (rotated 180°) and draws the robot face (top), the
+   2x2 status grid, and the sensor readout strip (bottom).
+5. Runs `demo_task`, stepping through the sequence above (~800 ms per step) and
+   updating the face expression for each phase, plus `sensor_task` refreshing the
+   lidar/accel/mag readout ~10 Hz.
 
 Motor speed is set by `MOTOR_SPEED` in `main/main.c` (0–800; default 400 for a
 gentle demo). Forward = `+MOTOR_SPEED`, Back = `-MOTOR_SPEED`, Stop = `0`.
@@ -276,6 +302,34 @@ I²C bus for systems with more motors. Supplied without pin headers.
 | Wheel width        | 27 mm                                               |
 | Motor dimensions   | 37.6 × 64.2 × 22.5 mm                               |
 | Weight             | approx. 58 g                                        |
+
+### VL53L1X ToF lidar (Qwiic)
+
+Laser Time-of-Flight distance sensor on a Qwiic breakout, wired into the shared
+GPIO4/5 I2C bus. [Electrokit 41036424](https://www.electrokit.com/avstandssensor-tof-lidar-30-4000mm-vl53l1x-qwiic).
+
+| Spec            | Detail                        |
+| --------------- | ----------------------------- |
+| Sensor          | VL53L1X                       |
+| Range           | approx. 30 mm to 4000 mm      |
+| Update rate     | up to 50 Hz                   |
+| Field of view   | 27°                           |
+| Interface       | I2C, address `0x29`           |
+| Supply / logic  | 3.3–5 V                       |
+
+### LSM303AGR accelerometer + magnetometer (Qwiic)
+
+6-axis IMU (3-axis accelerometer + 3-axis magnetometer) on a Qwiic breakout,
+also on the GPIO4/5 I2C bus. [Electrokit 41035585](https://www.electrokit.com/rorelsegivare-och-magnetometer-lsm303agr-qwiic) /
+[Adafruit 4413](https://www.adafruit.com/product/4413).
+
+| Spec            | Detail                                   |
+| --------------- | ---------------------------------------- |
+| Sensor          | LSM303AGR                                |
+| Accelerometer   | ±2/±4/±8/±16 g (firmware uses ±2 g)      |
+| Magnetometer    | ±50 gauss                                |
+| Interface       | I2C, addresses `0x19` (acc) + `0x1E` (mag)|
+| Supply / logic  | 3.3–5 V                                  |
 
 ### Prototyping/perfboard chassis
 
