@@ -234,6 +234,7 @@ gentle motion). Forward = `+MOTOR_SPEED`, Back = `-MOTOR_SPEED`, Stop = `0`.
 ## Build & flash
 
 ```bash
+source /path/to/esp-idf/export.sh   # activate the ESP-IDF environment
 idf.py set-target esp32c6
 idf.py build
 idf.py -p /dev/ttyACM0 flash monitor
