@@ -42,10 +42,16 @@ static const char *TAG = "main";
 #define MOTOR_SPEED     400   // 0..800 (half power for a gentle demo)
 
 // Reactive-behaviour tuning
-#define LIDAR_STOP_MM   200   // obstacle distance that halts forward driving
-#define LIDAR_CLEAR_MM  300   // path must reopen past this before resuming
+#define LIDAR_STOP_MM   100   // obstacle distance that halts forward driving (10 cm)
+#define LIDAR_OPEN_MM   200   // a scanned side must be more open than this to turn that way (20 cm)
+#define LIDAR_CLEAR_MM  300   // path ahead must reopen past this before resuming forward
 #define LIDAR_MAX_MM    4000  // readings above this (or 0) are treated invalid
+#define LIDAR_MIN_MM    40    // readings below this are treated as sensor noise
 #define STALL_G_THRESH  0.04f // min accel jitter (g) expected while rolling
+#define TURN_TARGET_DEG 40.0f // compass heading change that completes one turn attempt
+#define TURN_TIMEOUT_MS 12500 // safety cap in case the heading doesn't move
+#define BACK_MS         3000  // reverse duration when neither side is open
+#define SCAN_DWELL_MS   2500  // how long to hold each look-left/look-right pose
 
 // Servo PWM parameters (50 Hz, 14-bit resolution)
 #define SERVO_FREQ_HZ       50
@@ -439,23 +445,28 @@ typedef enum {
     FACE_SLEEP,
     FACE_SURPRISE,
     FACE_IDLE,
-    FACE_SAD,
-    FACE_HAPPY,
-    FACE_FURIOUS,
+    FACE_FORWARD,     // driving forward (open eyes, dome shape)
+    FACE_LOOK_LEFT,   // scanning/turning left (open eyes, pupils shifted left)
+    FACE_LOOK_RIGHT,  // scanning/turning right (open eyes, pupils shifted right)
+    FACE_BACK,        // reversing (worried "/ \" slant)
+    FACE_PANIC,       // obstacle closer than LIDAR_STOP_MM (red "\ /" slant)
 } face_expr_t;
 
 #define EYE_W 48
 #define EYE_H 31        // half-height eyes
-#define EYE_SLANT 240   // slant angle for sad/furious eyes (0.1 deg units)
+#define EYE_SLANT 240   // slant angle for back/panic eyes (0.1 deg units)
+#define PUPIL_SHIFT 14  // how far the pupil moves for look-left/right (px)
 #define FACE_BG lv_color_make(0x05, 0x07, 0x0D)
+#define EYE_COLOR_NORMAL lv_color_make(0x33, 0xE1, 0xFF)
+#define EYE_COLOR_PANIC  lv_color_make(0xFF, 0x33, 0x33)
 
 // Each eye has two background-coloured eyelids (top + bottom) that set_face()
-// reshapes to carve every expression.
+// reshapes to carve every expression, plus a pupil that can shift sideways.
+static lv_obj_t *s_eye[2];
+static lv_obj_t *s_eye_pupil[2];
 static lv_obj_t *s_eye_lid_top[2];
 static lv_obj_t *s_eye_lid_bot[2];
-static lv_obj_t *s_zzz = NULL;   // "z z z" shown only while sleeping
-static lv_obj_t *s_ahah = NULL;  // "Ahah" shown only while happy
-static lv_obj_t *s_grrr = NULL;  // "Grrr!" shown only while happy
+static lv_obj_t *s_cue = NULL;   // text cue shown for some expressions
 
 // Position/size one lid; opa == TRANSP hides it.
 static void set_lid(lv_obj_t *lid, lv_opa_t opa, int w, int h, int x, int y, int rot)
@@ -471,31 +482,50 @@ static void set_lid(lv_obj_t *lid, lv_opa_t opa, int w, int h, int x, int y, int
     lv_obj_set_style_transform_rotation(lid, rot, LV_PART_MAIN);
 }
 
-// Carve each expression by sizing/positioning the eyelids over each eye:
-//   surprise -> both lids hidden (full open eye)
-//   idle     -> top + bottom lids leave a short, centred band (+ pupil)
-//   sleep    -> top lid covers all but a thin bottom slit
-//   happy    -> bottom lid covers the bottom, leaving an upward dome
-//   sad      -> slanted top lid, inner corner low
-//   furious  -> slanted top lid, inner corner high
+// Carve each expression by sizing/positioning the eyelids over each eye and
+// shifting the pupils / eye colour / text cue as needed:
+//   surprise    -> both lids hidden (full open eye)
+//   idle        -> top + bottom lids leave a short, centred band
+//   sleep       -> top lid covers all but a thin bottom slit
+//   forward     -> bottom lid covers the bottom, leaving an upward dome
+//   look_l/r    -> full open eye, pupils shifted toward the look direction
+//   back        -> slanted "/ \" (inner corners high) + "REV" cue
+//   panic       -> slanted "\ /" (inner corners low) + red eyes + "!!!" cue
 static void set_face(face_expr_t e)
 {
+    int pupil_dx = 0;
+    if (e == FACE_LOOK_LEFT) {
+        pupil_dx = -PUPIL_SHIFT;
+    } else if (e == FACE_LOOK_RIGHT) {
+        pupil_dx = PUPIL_SHIFT;
+    }
+
     for (int i = 0; i < 2; i++) {
         lv_obj_t *top = s_eye_lid_top[i];
         lv_obj_t *bot = s_eye_lid_bot[i];
 
-        // Defaults: both lids hidden (used by "surprise")
+        // Defaults: both lids hidden (used by "surprise"/look/panic-open states)
         set_lid(top, LV_OPA_TRANSP, EYE_W, EYE_H, 0, 0, 0);
         set_lid(bot, LV_OPA_TRANSP, EYE_W, EYE_H, 0, 0, 0);
+
+        if (s_eye_pupil[i]) {
+            lv_obj_align(s_eye_pupil[i], LV_ALIGN_CENTER, pupil_dx, 0);
+        }
+        if (s_eye[i]) {
+            lv_obj_set_style_bg_color(s_eye[i],
+                e == FACE_PANIC ? EYE_COLOR_PANIC : EYE_COLOR_NORMAL, LV_PART_MAIN);
+        }
 
         // Geometry scales with EYE_H so expressions still carve a half-height eye
         const int band = EYE_H / 3;         // idle top/bottom lid height
         const int slit = 4;                 // sleep bottom slit
-        const int dome = EYE_H * 2 / 3;     // happy bottom cover height
+        const int dome = EYE_H * 2 / 3;     // forward bottom cover height
         const int slant_y = (EYE_H / 2) - 90;   // slant bar vertical placement
 
         switch (e) {
         case FACE_SURPRISE:             // full open eye
+        case FACE_LOOK_LEFT:            // full open eye, pupil shifted left
+        case FACE_LOOK_RIGHT:           // full open eye, pupil shifted right
             break;
         case FACE_IDLE:                 // short centred band + pupil
             set_lid(top, LV_OPA_COVER, EYE_W, band, 0, 0, 0);
@@ -504,43 +534,49 @@ static void set_face(face_expr_t e)
         case FACE_SLEEP:                // cover all but a thin bottom slit
             set_lid(top, LV_OPA_COVER, EYE_W, EYE_H - slit, 0, 0, 0);
             break;
-        case FACE_HAPPY:                // cover bottom -> upward dome
+        case FACE_FORWARD:              // cover bottom -> upward dome
             set_lid(bot, LV_OPA_COVER, EYE_W, dome, 0, EYE_H - dome, 0);
             break;
-        case FACE_SAD:                  // eyes slant "/ \" (inner corners high)
+        case FACE_BACK:                  // eyes slant "/ \" (inner corners high)
             set_lid(top, LV_OPA_COVER, EYE_W + 80, 90, (EYE_W - (EYE_W + 80)) / 2,
                     slant_y, (i == 0) ? -EYE_SLANT : EYE_SLANT);
             break;
-        case FACE_FURIOUS:              // eyes slant "\ /" (inner corners low)
+        case FACE_PANIC:                 // eyes slant "\ /" (inner corners low)
             set_lid(top, LV_OPA_COVER, EYE_W + 80, 90, (EYE_W - (EYE_W + 80)) / 2,
                     slant_y, (i == 0) ? EYE_SLANT : -EYE_SLANT);
             break;
         }
     }
-    if (s_zzz) {
-        lv_obj_set_style_opa(s_zzz,
-            e == FACE_SLEEP ? LV_OPA_COVER : LV_OPA_TRANSP, LV_PART_MAIN);
-    }
-    if (s_ahah) {
-        lv_obj_set_style_opa(s_ahah,
-            e == FACE_HAPPY ? LV_OPA_COVER : LV_OPA_TRANSP, LV_PART_MAIN);
-    }
-    if (s_grrr) {
-        lv_obj_set_style_opa(s_grrr,
-            e == FACE_FURIOUS ? LV_OPA_COVER : LV_OPA_TRANSP, LV_PART_MAIN);
+
+    if (s_cue) {
+        const char *text = "";
+        switch (e) {
+        case FACE_SLEEP:      text = "z Z z"; break;
+        case FACE_LOOK_LEFT:  text = "<<";    break;
+        case FACE_LOOK_RIGHT: text = ">>";    break;
+        case FACE_BACK:       text = "REV";   break;
+        case FACE_PANIC:      text = "!!!";   break;
+        default:              text = "";      break;
+        }
+        lv_label_set_text(s_cue, text);
+        lv_obj_set_style_opa(s_cue, text[0] ? LV_OPA_COVER : LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_text_color(s_cue,
+            e == FACE_PANIC ? EYE_COLOR_PANIC : EYE_COLOR_NORMAL, LV_PART_MAIN);
     }
 }
 
 static const char *face_name(face_expr_t e)
 {
     switch (e) {
-    case FACE_SLEEP:   return "sleep";
-    case FACE_SURPRISE:return "surprise";
-    case FACE_IDLE:    return "idle";
-    case FACE_SAD:     return "sad";
-    case FACE_HAPPY:   return "happy";
-    case FACE_FURIOUS: return "furious";
-    default:           return "?";
+    case FACE_SLEEP:      return "sleep";
+    case FACE_SURPRISE:   return "surprise";
+    case FACE_IDLE:       return "idle";
+    case FACE_FORWARD:    return "forward";
+    case FACE_LOOK_LEFT:  return "look_left";
+    case FACE_LOOK_RIGHT: return "look_right";
+    case FACE_BACK:       return "back";
+    case FACE_PANIC:      return "panic";
+    default:              return "?";
     }
 }
 
@@ -560,7 +596,9 @@ static uint16_t lidar_mm_now(void)
         return 0;
     }
     uint16_t d = s_lidar_mm;
-    if (d == 0 || d > LIDAR_MAX_MM) {
+    // Below the sensor's rated minimum range (~30mm) a "no target" condition
+    // can report noise as a small distance instead of a real close object.
+    if (d == 0 || d < LIDAR_MIN_MM || d > LIDAR_MAX_MM) {
         return 0;
     }
     return d;
@@ -572,6 +610,26 @@ static float accel_mag(void)
     return sqrtf(s_acc_g[0] * s_acc_g[0] +
                  s_acc_g[1] * s_acc_g[1] +
                  s_acc_g[2] * s_acc_g[2]);
+}
+
+// Compass heading in degrees [0, 360) from the horizontal magnetometer axes.
+// No tilt compensation - fine for a robot that stays flat on the ground.
+static float mag_heading_deg(void)
+{
+    float heading = atan2f(s_mag_ut[1], s_mag_ut[0]) * 180.0f / (float)M_PI;
+    if (heading < 0) {
+        heading += 360.0f;
+    }
+    return heading;
+}
+
+// Shortest signed angle from `from` to `to`, in (-180, 180] degrees
+static float heading_diff_deg(float from, float to)
+{
+    float d = to - from;
+    while (d > 180.0f) { d -= 360.0f; }
+    while (d < -180.0f) { d += 360.0f; }
+    return d;
 }
 
 // Point both servos to an angle as a "look" gesture and reflect it on the tiles
@@ -602,9 +660,57 @@ static float measure_movement(void)
     return total;
 }
 
-// Reactive behaviour: drive forward while the path is clear; when something is
-// within LIDAR_STOP_MM, stop, look left/right, and turn toward the opener side.
-// The accelerometer confirms the wheels are actually moving while driving.
+// Turn in place toward `go_left`, tracking actual rotation via the compass
+// heading (falling back to a timeout if no magnetometer is present).
+static void turn_toward(bool go_left)
+{
+    show_face(go_left ? FACE_LOOK_LEFT : FACE_LOOK_RIGHT);
+    ESP_LOGI(TAG, "Turning %s", go_left ? "left" : "right");
+
+    if (go_left) {
+        motor_back(MOTOR_LEFT_CH);
+        motor_fwd(MOTOR_RIGHT_CH);
+        ui_set_tiles("90\xC2\xB0", "90\xC2\xB0", "Rev", "Fwd",
+                     false, false, true, true);
+    } else {
+        motor_fwd(MOTOR_LEFT_CH);
+        motor_back(MOTOR_RIGHT_CH);
+        ui_set_tiles("90\xC2\xB0", "90\xC2\xB0", "Fwd", "Rev",
+                     false, false, true, true);
+    }
+
+    float start_heading = s_have_mag ? mag_heading_deg() : 0.0f;
+    TickType_t t0 = xTaskGetTickCount();
+    const char *stop_reason = "timeout";
+    while ((xTaskGetTickCount() - t0) < pdMS_TO_TICKS(TURN_TIMEOUT_MS)) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        uint16_t dd = lidar_mm_now();
+        if (dd == 0 || dd >= LIDAR_CLEAR_MM) {
+            stop_reason = "path reopened";
+            break;   // path ahead reopened
+        }
+        if (s_have_mag) {
+            float turned = heading_diff_deg(start_heading, mag_heading_deg());
+            if (fabsf(turned) >= TURN_TARGET_DEG) {
+                stop_reason = "compass target reached";
+                break;
+            }
+        }
+    }
+    motor_stop(MOTOR_LEFT_CH);
+    motor_stop(MOTOR_RIGHT_CH);
+
+    uint32_t elapsed_ms = (xTaskGetTickCount() - t0) * portTICK_PERIOD_MS;
+    float turned = s_have_mag ? heading_diff_deg(start_heading, mag_heading_deg()) : 0.0f;
+    ESP_LOGI(TAG, "Turn %s done: %s (turned %.1f deg in %u ms)",
+             go_left ? "left" : "right", stop_reason, turned, (unsigned int)elapsed_ms);
+}
+
+// Reactive behaviour: drive forward while the path is clear (> 10 cm); when an
+// obstacle is closer, look left/right and turn toward whichever side is more
+// open (> 20 cm), confirming the turn with the compass. If neither side is
+// open enough, back up and scan again. The accelerometer confirms the wheels
+// are actually moving while driving forward.
 static void behave_task(void *arg)
 {
     look(90);   // center the head
@@ -613,52 +719,50 @@ static void behave_task(void *arg)
         uint16_t d = lidar_mm_now();
 
         if (d != 0 && d <= LIDAR_STOP_MM) {
-            // Obstacle within 200 mm: stop and look left / right
+            // Obstacle within 10 cm: stop and look left / right
             motor_stop(MOTOR_LEFT_CH);
             motor_stop(MOTOR_RIGHT_CH);
-            show_face(FACE_SURPRISE);
+            show_face(FACE_PANIC);
             ESP_LOGI(TAG, "Obstacle at %u mm - scanning", d);
 
+            show_face(FACE_LOOK_LEFT);
             look(20);
-            vTaskDelay(pdMS_TO_TICKS(500));
+            vTaskDelay(pdMS_TO_TICKS(SCAN_DWELL_MS));
             uint16_t left = lidar_mm_now();
+            show_face(FACE_LOOK_RIGHT);
             look(160);
-            vTaskDelay(pdMS_TO_TICKS(500));
+            vTaskDelay(pdMS_TO_TICKS(SCAN_DWELL_MS));
             uint16_t right = lidar_mm_now();
             look(90);
 
-            // Turn in place toward whichever side looked more open
-            bool go_left = (left >= right);
-            show_face(FACE_SAD);
-            ESP_LOGI(TAG, "Scan L=%u R=%u -> turn %s",
-                     left, right, go_left ? "left" : "right");
-            if (go_left) {
+            bool left_open = (left == 0 || left >= LIDAR_OPEN_MM);
+            bool right_open = (right == 0 || right >= LIDAR_OPEN_MM);
+            ESP_LOGI(TAG, "Scan L=%u R=%u (open L=%d R=%d)",
+                     left, right, left_open, right_open);
+
+            if (!left_open && !right_open) {
+                // Neither side is open enough: back up and try scanning again
+                show_face(FACE_BACK);
+                ESP_LOGI(TAG, "No opening found - backing up for %d ms", BACK_MS);
                 motor_back(MOTOR_LEFT_CH);
-                motor_fwd(MOTOR_RIGHT_CH);
-                ui_set_tiles("90\xC2\xB0", "90\xC2\xB0", "Rev", "Fwd",
-                             false, false, true, true);
-            } else {
-                motor_fwd(MOTOR_LEFT_CH);
                 motor_back(MOTOR_RIGHT_CH);
-                ui_set_tiles("90\xC2\xB0", "90\xC2\xB0", "Fwd", "Rev",
+                ui_set_tiles("90\xC2\xB0", "90\xC2\xB0", "Rev", "Rev",
                              false, false, true, true);
+                vTaskDelay(pdMS_TO_TICKS(BACK_MS));
+                motor_stop(MOTOR_LEFT_CH);
+                motor_stop(MOTOR_RIGHT_CH);
+                ESP_LOGI(TAG, "Back up done - rescanning");
+                continue;
             }
 
-            // Rotate until the path ahead reopens (or ~1.8 s timeout)
-            for (int t = 0; t < 12; t++) {
-                vTaskDelay(pdMS_TO_TICKS(150));
-                uint16_t dd = lidar_mm_now();
-                if (dd == 0 || dd >= LIDAR_CLEAR_MM) {
-                    break;
-                }
-            }
-            motor_stop(MOTOR_LEFT_CH);
-            motor_stop(MOTOR_RIGHT_CH);
+            // Turn toward whichever side is open (prefer the more open one)
+            bool go_left = left_open && (!right_open || left >= right);
+            turn_toward(go_left);
             continue;
         }
 
         // Path clear: walk forward
-        show_face(FACE_HAPPY);
+        show_face(FACE_FORWARD);
         motor_fwd(MOTOR_LEFT_CH);
         motor_fwd(MOTOR_RIGHT_CH);
         ui_set_tiles("90\xC2\xB0", "90\xC2\xB0", "Fwd", "Fwd",
@@ -673,7 +777,7 @@ static void behave_task(void *arg)
         if (s_have_accel && moved < STALL_G_THRESH) {
             ESP_LOGW(TAG, "Wheels not moving (jitter %.3f g < %.3f) - stuck?",
                      moved, (float)STALL_G_THRESH);
-            show_face(FACE_FURIOUS);
+            show_face(FACE_PANIC);
             motor_stop(MOTOR_LEFT_CH);
             motor_stop(MOTOR_RIGHT_CH);
             ui_set_tiles("90\xC2\xB0", "90\xC2\xB0", "STUCK", "STUCK",
@@ -695,6 +799,7 @@ static void sensor_task(void *arg)
             if (vl53l1x_read_mm(&s_lidar, &mm) == ESP_OK) {
                 s_lidar_mm = mm;
             }
+            // ESP_ERR_TIMEOUT (sample not ready yet) keeps the previous value
         }
         if (s_have_accel) {
             lsm303_read_accel();
@@ -778,8 +883,10 @@ static void make_eye(lv_obj_t *parent, int idx, int x_off)
     lv_obj_set_style_pad_all(eye, 0, LV_PART_MAIN);
     lv_obj_set_style_clip_corner(eye, true, LV_PART_MAIN);
     lv_obj_clear_flag(eye, LV_OBJ_FLAG_SCROLLABLE);
+    s_eye[idx] = eye;
 
-    // Tiny black round pupil in the middle of the eye
+    // Tiny black round pupil in the middle of the eye; shifted sideways by
+    // set_face() for the look-left/look-right expressions.
     lv_obj_t *pupil = lv_obj_create(eye);
     lv_obj_set_size(pupil, 12, 12);
     lv_obj_center(pupil);
@@ -788,6 +895,7 @@ static void make_eye(lv_obj_t *parent, int idx, int x_off)
     lv_obj_set_style_radius(pupil, LV_RADIUS_CIRCLE, LV_PART_MAIN);
     lv_obj_set_style_pad_all(pupil, 0, LV_PART_MAIN);
     lv_obj_clear_flag(pupil, LV_OBJ_FLAG_SCROLLABLE);
+    s_eye_pupil[idx] = pupil;
 
     // Two eyelids (top + bottom) drawn over the pupil; reshaped by set_face()
     for (int k = 0; k < 2; k++) {
@@ -828,26 +936,13 @@ static void create_ui(void)
     make_eye(top_panel, 0, -(EYE_W / 2 + 14));
     make_eye(top_panel, 1,  (EYE_W / 2 + 14));
 
-    // "z Z z" shown only while sleeping
-    s_zzz = lv_label_create(top_panel);
-    lv_label_set_text(s_zzz, "z Z z");
-    lv_obj_set_style_text_color(s_zzz, lv_color_make(0x60, 0x90, 0xC0), LV_PART_MAIN);
-    lv_obj_align(s_zzz, LV_ALIGN_TOP_RIGHT, -6, 2);
-    lv_obj_set_style_opa(s_zzz, LV_OPA_TRANSP, LV_PART_MAIN);
-
-    // "Ahah" shown only while happy
-    s_ahah = lv_label_create(top_panel);
-    lv_label_set_text(s_ahah, "Ahah");
-    lv_obj_set_style_text_color(s_ahah, lv_color_make(0x33, 0xE1, 0xFF), LV_PART_MAIN);
-    lv_obj_align(s_ahah, LV_ALIGN_TOP_LEFT, -6, 2);
-    lv_obj_set_style_opa(s_ahah, LV_OPA_TRANSP, LV_PART_MAIN);
-
-    // "Grrr!" shown only while happy
-    s_grrr = lv_label_create(top_panel);
-    lv_label_set_text(s_grrr, "Grrr!");
-    lv_obj_set_style_text_color(s_grrr, lv_color_make(0x33, 0xE1, 0xFF), LV_PART_MAIN);
-    lv_obj_align(s_grrr, LV_ALIGN_TOP_RIGHT, -6, 2);
-    lv_obj_set_style_opa(s_grrr, LV_OPA_TRANSP, LV_PART_MAIN);
+    // Text cue shown/coloured per expression by set_face() ("z Z z", "<<",
+    // ">>", "REV", "!!!")
+    s_cue = lv_label_create(top_panel);
+    lv_label_set_text(s_cue, "");
+    lv_obj_set_style_text_color(s_cue, EYE_COLOR_NORMAL, LV_PART_MAIN);
+    lv_obj_align(s_cue, LV_ALIGN_TOP_RIGHT, -6, 2);
+    lv_obj_set_style_opa(s_cue, LV_OPA_TRANSP, LV_PART_MAIN);
 
     // Tiny, dim firmware version in the corner
     const esp_app_desc_t *app_desc = esp_app_get_description();
