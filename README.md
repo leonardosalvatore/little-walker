@@ -18,12 +18,15 @@ See [Components](#components) for full specifications.
 
 The display is split in two halves:
 
-- **Top (~50%): an animated robot face** — two half-height eyes that change
-  expression as the robot behaves (see [Robot face](#robot-face)).
+- **Top (~50%): a polar occupancy map** — the robot is the centre (not drawn).
+  Each lidar hit is one pixel: angle from the magnetometer heading (`atan2` of
+  MAG Y, MAG X, plus the current look angle), radius from lidar distance on a
+  **log** scale so nearby objects spread out. The canvas is 6000 mm across, so
+  3000 mm reaches the border. Dots stay until the map is wiped every 10 s.
 - **Bottom (~50%): a 2x2 grid of status tiles** (Left Servo, Right Servo, Left
   Motor, Right Motor), highlighting the active one in blue, with a **sensor
   readout strip** beneath it (lidar distance, accelerometer, magnetometer). The
-  firmware version is shown dimly in the face panel's corner.
+  firmware version is shown dimly in the map panel's corner.
 
 The whole UI is rotated 180° (the ST7789 is mounted `mirror_x`/`mirror_y`) so the
 board can sit inverted on the chassis.
@@ -46,7 +49,7 @@ a fixed script:
              |                 |          turn toward the
             yes                no          more-open side,
           keep rolling      "STUCK":       then re-check
-          (happy face)     stop + furious  (sad -> surprise)
+                               stop
 ```
 
 - **Walk toward open space:** while the lidar reads more than `LIDAR_STOP_MM`
@@ -57,7 +60,7 @@ a fixed script:
   `LIDAR_CLEAR_MM` (300 mm).
 - **Wheel-motion check:** while driving forward it watches accelerometer
   "jitter"; if the wheels are commanded to move but the accel stays too still
-  (below `STALL_G_THRESH`), it flags `STUCK`, stops, and shows the furious face.
+  (below `STALL_G_THRESH`), it flags `STUCK` and stops.
   The measured jitter is logged each forward burst so the threshold is easy to
   tune for your surface.
 
@@ -193,25 +196,21 @@ and does not stop the motor demo.
 - Keep motor (VIN) wiring on its own rail away from the logic rail; only the
   ground is shared.
 
-## Robot face
+## Polar map
 
-The top panel renders two cyan rounded-rect eyes. Each eye is carved by two
-background-coloured "eyelids" (top + bottom) that resize/rotate to form an
-expression; some expressions also show a small text cue and a round black pupil.
+The top panel is a 2D occupancy sketch in polar coordinates. The robot sits at
+the centre (not drawn). About ten times a second the firmware plots **one
+pixel**:
 
-| Expression | Eyes                              | Pupil | Text cue |
-| ---------- | --------------------------------- | ----- | -------- |
-| `sleep`    | thin bottom slit                  | no    | `z Z z`  |
-| `surprise` | wide open                         | yes   | —        |
-| `idle`     | short, centred band               | yes   | —        |
-| `sad`      | slanted `/ \` (inner corners up)  | no    | —        |
-| `happy`    | upward dome                       | no    | `Ahah`   |
-| `furious`  | slanted `\ /` (inner corners down)| no    | `Grrr!`  |
+- **Angle:** magnetometer heading, `atan2(MAG_Y, MAG_X)`, plus the current servo
+  look offset (90° is forward, toward the top of the screen).
+- **Radius:** lidar distance, **log-scaled** so close hits are visible. The
+  canvas is 6000 mm across; 3000 mm (lidar long-mode neighbourhood) reaches the
+  border.
 
-The current expression is also printed to the serial log (`Expression: <name>`).
-`behave_task` maps a face to each behaviour: `happy` while driving forward,
-`surprise` when an obstacle is detected within 200 mm, `sad` while scanning and
-turning, and `furious` when the wheels appear stuck.
+Pixels stay until the canvas is cleared every 10 seconds. Behind the dots is a
+dark **+** compass: one line is north–south, the other east–west. Magnetic north
+is the bottom of the map, marked with a small **red circle** on that tip.
 
 ## Firmware behaviour
 
@@ -223,7 +222,7 @@ On boot the firmware:
    does not stop the motors during the servo phases.
 3. Probes the Qwiic sensors (VL53L1X lidar, LSM303AGR accel/mag) on the same I2C
    bus; any that are missing are skipped and shown as `--`.
-4. Brings up the LCD + LVGL (rotated 180°) and draws the robot face (top), the
+4. Brings up the LCD + LVGL (rotated 180°) and draws the polar map (top), the
    2x2 status grid, and the sensor readout strip (bottom).
 5. Runs `sensor_task` (lidar/accel/mag readout ~10 Hz) and `behave_task` (the
    reactive sense-act loop described in [Reactive behaviour](#reactive-behaviour)).
@@ -336,11 +335,18 @@ GPIO4/5 I2C bus. [Electrokit 41036424](https://www.electrokit.com/avstandssensor
 | Spec            | Detail                        |
 | --------------- | ----------------------------- |
 | Sensor          | VL53L1X                       |
-| Range           | approx. 30 mm to 4000 mm      |
+| Range           | long mode ~30–3600 mm (used); short mode up to 1360 mm |
 | Update rate     | up to 50 Hz                   |
 | Field of view   | 27°                           |
 | Interface       | I2C, address `0x29`           |
 | Supply / logic  | 3.3–5 V                       |
+
+The VL53L1X has two distance modes (ST ULD / Adafruit): **short** (better ambient
+immunity, max ~1360 mm) and **long** (max ~3600 mm, which covers 0–3000 mm).
+Firmware starts the sensor in long mode. A ranging sample with an invalid range
+status (nothing in front, or a target beyond the mode's reach) is not a number
+— Adafruit's library returns `None`; we treat it as 0 / `--` on the LCD and as a
+clear path for the walker.
 
 ### LSM303AGR accelerometer + magnetometer (Qwiic)
 

@@ -11,6 +11,12 @@ static const char *TAG = "vl53l1x";
 #define REG_MODEL_ID               0x010F
 #define REG_VHV_CONFIG_TIMEOUT     0x0008
 #define REG_GPIO_HV_STATUS         0x0031
+#define REG_PHASECAL_TIMEOUT_MACROP 0x004B
+#define REG_VCSEL_PERIOD_A         0x0060
+#define REG_VCSEL_PERIOD_B         0x0063
+#define REG_VALID_PHASE_HIGH       0x0069
+#define REG_SD_CONFIG_WOI_SD0      0x0078
+#define REG_SD_CONFIG_INITIAL_PHASE 0x007A
 #define REG_SYSTEM_INTERRUPT_CLEAR 0x0086
 #define REG_SYSTEM_MODE_START      0x0087
 #define REG_RESULT_RANGE_STATUS    0x0089
@@ -19,6 +25,9 @@ static const char *TAG = "vl53l1x";
 
 #define MODEL_ID_EXPECTED          0xEACC
 #define I2C_TIMEOUT_MS             100
+// RESULT__RANGE_STATUS bits [4:0] == 9 means the ranging sample is valid
+// (ST ULD GetRangeStatus). Any other code is no-target / out of range / fail.
+#define RANGE_STATUS_VALID         9
 
 // ST ULD default configuration, written in one block starting at 0x002D.
 // The final byte (register 0x0087 = 0x40) starts ranging.
@@ -110,6 +119,35 @@ static esp_err_t wait_data_ready(vl53l1x_t *s, int timeout_ms)
     return ESP_ERR_TIMEOUT;
 }
 
+static esp_err_t reg_write16(vl53l1x_t *s, uint16_t reg, uint16_t val)
+{
+    uint8_t b[2] = { (uint8_t)(val >> 8), (uint8_t)(val & 0xFF) };
+    return reg_write(s, reg, b, 2);
+}
+
+esp_err_t vl53l1x_set_distance_mode(vl53l1x_t *s, vl53l1x_distance_mode_t mode)
+{
+    // VCSEL periods and phase windows from ST ULD SetDistanceMode /
+    // Adafruit CircuitPython VL53L1X. Short: up to 1360 mm. Long: up to 3600 mm.
+    if (mode == VL53L1X_DISTANCE_SHORT) {
+        reg_write8(s, REG_PHASECAL_TIMEOUT_MACROP, 0x14);
+        reg_write8(s, REG_VCSEL_PERIOD_A, 0x07);
+        reg_write8(s, REG_VCSEL_PERIOD_B, 0x05);
+        reg_write8(s, REG_VALID_PHASE_HIGH, 0x38);
+        reg_write16(s, REG_SD_CONFIG_WOI_SD0, 0x0705);
+        return reg_write16(s, REG_SD_CONFIG_INITIAL_PHASE, 0x0606);
+    }
+    if (mode == VL53L1X_DISTANCE_LONG) {
+        reg_write8(s, REG_PHASECAL_TIMEOUT_MACROP, 0x0A);
+        reg_write8(s, REG_VCSEL_PERIOD_A, 0x0F);
+        reg_write8(s, REG_VCSEL_PERIOD_B, 0x0D);
+        reg_write8(s, REG_VALID_PHASE_HIGH, 0xB8);
+        reg_write16(s, REG_SD_CONFIG_WOI_SD0, 0x0F0D);
+        return reg_write16(s, REG_SD_CONFIG_INITIAL_PHASE, 0x0E0E);
+    }
+    return ESP_ERR_INVALID_ARG;
+}
+
 esp_err_t vl53l1x_init(i2c_master_bus_handle_t bus, vl53l1x_t *sensor)
 {
     i2c_device_config_t dev_cfg = {
@@ -158,12 +196,18 @@ esp_err_t vl53l1x_init(i2c_master_bus_handle_t bus, vl53l1x_t *sensor)
     reg_write8(sensor, REG_SYSTEM_MODE_START, 0x00);   // stop ranging
     reg_write8(sensor, REG_VHV_CONFIG_TIMEOUT, 0x09);
     reg_write8(sensor, 0x000B, 0x00);
+    // Long mode: ~40 mm to ~3600 mm (ST/Adafruit). Covers 0-3000 mm.
+    err = vl53l1x_set_distance_mode(sensor, VL53L1X_DISTANCE_LONG);
+    if (err != ESP_OK) {
+        return err;
+    }
     err = reg_write8(sensor, REG_SYSTEM_MODE_START, 0x40);  // start ranging
     if (err != ESP_OK) {
         return err;
     }
 
-    ESP_LOGI(TAG, "VL53L1X ranging started at 0x%02X", VL53L1X_I2C_ADDR);
+    ESP_LOGI(TAG, "VL53L1X ranging started at 0x%02X (long mode, up to 3600 mm)",
+             VL53L1X_I2C_ADDR);
     return ESP_OK;
 }
 
@@ -173,14 +217,25 @@ esp_err_t vl53l1x_read_mm(vl53l1x_t *sensor, uint16_t *mm)
         return ESP_ERR_TIMEOUT;
     }
 
+    uint8_t range_st = 0;
     uint16_t distance = 0;
-    esp_err_t err = reg_read16(sensor, REG_RESULT_DISTANCE, &distance);
+    esp_err_t err = reg_read8(sensor, REG_RESULT_RANGE_STATUS, &range_st);
+    if (err == ESP_OK) {
+        err = reg_read16(sensor, REG_RESULT_DISTANCE, &distance);
+    }
 
     // Clear the interrupt so the next sample can be produced
     reg_write8(sensor, REG_SYSTEM_INTERRUPT_CLEAR, 0x01);
 
-    if (err == ESP_OK) {
-        *mm = distance;
+    if (err != ESP_OK) {
+        return err;
     }
-    return err;
+    // No target, out of range, or wrap-around: ignore the distance register
+    // (Adafruit's CircuitPython driver returns None in this case).
+    if ((range_st & 0x1F) != RANGE_STATUS_VALID) {
+        *mm = 0;
+        return ESP_ERR_NOT_FOUND;
+    }
+    *mm = distance;
+    return ESP_OK;
 }

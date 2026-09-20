@@ -14,6 +14,7 @@
 #include "esp_app_desc.h"
 #include "vl53l1x.h"
 #include <math.h>
+#include <stdlib.h>
 
 static const char *TAG = "main";
 
@@ -45,13 +46,17 @@ static const char *TAG = "main";
 #define LIDAR_STOP_MM   100   // obstacle distance that halts forward driving (10 cm)
 #define LIDAR_OPEN_MM   200   // a scanned side must be more open than this to turn that way (20 cm)
 #define LIDAR_CLEAR_MM  300   // path ahead must reopen past this before resuming forward
-#define LIDAR_MAX_MM    4000  // readings above this (or 0) are treated invalid
-#define LIDAR_MIN_MM    40    // readings below this are treated as sensor noise
+#define LIDAR_MAX_MM    3600  // VL53L1X long-mode max (Adafruit/ST: 360 cm)
+#define LIDAR_MIN_MM    30    // below ~30 mm is below the sensor's rated floor
 #define STALL_G_THRESH  0.04f // min accel jitter (g) expected while rolling
 #define TURN_TARGET_DEG 40.0f // compass heading change that completes one turn attempt
 #define TURN_TIMEOUT_MS 12500 // safety cap in case the heading doesn't move
 #define BACK_MS         3000  // reverse duration when neither side is open
 #define SCAN_DWELL_MS   2500  // how long to hold each look-left/look-right pose
+#define MAP_WIDTH_MM    6000  // canvas width in millimetres (centre to edge = 3000 mm)
+#define MAP_RADIUS_MM   (MAP_WIDTH_MM / 2)
+#define MAP_LOG_NEAR_MM 30    // log floor so nearby lidar hits are not crushed to the origin
+#define MAP_CLEAR_MS    10000 // wipe the accumulated dots after this many ms
 
 // Servo PWM parameters (50 Hz, 14-bit resolution)
 #define SERVO_FREQ_HZ       50
@@ -302,6 +307,7 @@ static bool s_have_lidar = false;
 
 // Latest readings, shared with the UI (only the sensor task writes them)
 static uint16_t s_lidar_mm = 0;
+static int s_look_deg = 90;   // current head angle (90 = forward)
 static float s_acc_g[3] = {0};
 static float s_mag_ut[3] = {0};
 
@@ -408,6 +414,19 @@ static lv_obj_t *tile_value[TILE_COUNT];
 // Full-width sensor readout below the 2x2 grid (lidar / accel / mag)
 static lv_obj_t *s_sensor_label = NULL;
 
+// Polar occupancy map in the top half of the screen
+static lv_obj_t *s_map_canvas = NULL;
+static lv_draw_buf_t *s_map_buf = NULL;
+static int s_map_w = 0;
+static int s_map_h = 0;
+static TickType_t s_map_cleared_ticks = 0;
+
+#define MAP_BG    lv_color_make(0x05, 0x07, 0x0D)
+#define MAP_DOT   lv_color_make(0x33, 0xE1, 0xFF)
+#define MAP_CROSS lv_color_make(0x3A, 0x3C, 0x4A)
+#define MAP_NORTH lv_color_make(0xE0, 0x28, 0x28)
+#define MAP_NORTH_R 3
+
 // Update a tile's value text and highlight it as active (blue) or idle (dark)
 static void set_tile(tile_id_t tile, const char *text, bool active)
 {
@@ -440,155 +459,6 @@ static void ui_set_tiles(const char *ls, const char *rs,
     }
 }
 
-// --- Robot face (two eyes) ---
-typedef enum {
-    FACE_SLEEP,
-    FACE_SURPRISE,
-    FACE_IDLE,
-    FACE_FORWARD,     // driving forward (open eyes, dome shape)
-    FACE_LOOK_LEFT,   // scanning/turning left (open eyes, pupils shifted left)
-    FACE_LOOK_RIGHT,  // scanning/turning right (open eyes, pupils shifted right)
-    FACE_BACK,        // reversing (worried "/ \" slant)
-    FACE_PANIC,       // obstacle closer than LIDAR_STOP_MM (red "\ /" slant)
-} face_expr_t;
-
-#define EYE_W 48
-#define EYE_H 31        // half-height eyes
-#define EYE_SLANT 240   // slant angle for back/panic eyes (0.1 deg units)
-#define PUPIL_SHIFT 14  // how far the pupil moves for look-left/right (px)
-#define FACE_BG lv_color_make(0x05, 0x07, 0x0D)
-#define EYE_COLOR_NORMAL lv_color_make(0x33, 0xE1, 0xFF)
-#define EYE_COLOR_PANIC  lv_color_make(0xFF, 0x33, 0x33)
-
-// Each eye has two background-coloured eyelids (top + bottom) that set_face()
-// reshapes to carve every expression, plus a pupil that can shift sideways.
-static lv_obj_t *s_eye[2];
-static lv_obj_t *s_eye_pupil[2];
-static lv_obj_t *s_eye_lid_top[2];
-static lv_obj_t *s_eye_lid_bot[2];
-static lv_obj_t *s_cue = NULL;   // text cue shown for some expressions
-
-// Position/size one lid; opa == TRANSP hides it.
-static void set_lid(lv_obj_t *lid, lv_opa_t opa, int w, int h, int x, int y, int rot)
-{
-    if (!lid) {
-        return;
-    }
-    lv_obj_set_style_opa(lid, opa, LV_PART_MAIN);
-    lv_obj_set_size(lid, w, h);
-    lv_obj_set_pos(lid, x, y);
-    lv_obj_set_style_transform_pivot_x(lid, w / 2, LV_PART_MAIN);
-    lv_obj_set_style_transform_pivot_y(lid, h / 2, LV_PART_MAIN);
-    lv_obj_set_style_transform_rotation(lid, rot, LV_PART_MAIN);
-}
-
-// Carve each expression by sizing/positioning the eyelids over each eye and
-// shifting the pupils / eye colour / text cue as needed:
-//   surprise    -> both lids hidden (full open eye)
-//   idle        -> top + bottom lids leave a short, centred band
-//   sleep       -> top lid covers all but a thin bottom slit
-//   forward     -> bottom lid covers the bottom, leaving an upward dome
-//   look_l/r    -> full open eye, pupils shifted toward the look direction
-//   back        -> slanted "/ \" (inner corners high) + "REV" cue
-//   panic       -> slanted "\ /" (inner corners low) + red eyes + "!!!" cue
-static void set_face(face_expr_t e)
-{
-    int pupil_dx = 0;
-    if (e == FACE_LOOK_LEFT) {
-        pupil_dx = -PUPIL_SHIFT;
-    } else if (e == FACE_LOOK_RIGHT) {
-        pupil_dx = PUPIL_SHIFT;
-    }
-
-    for (int i = 0; i < 2; i++) {
-        lv_obj_t *top = s_eye_lid_top[i];
-        lv_obj_t *bot = s_eye_lid_bot[i];
-
-        // Defaults: both lids hidden (used by "surprise"/look/panic-open states)
-        set_lid(top, LV_OPA_TRANSP, EYE_W, EYE_H, 0, 0, 0);
-        set_lid(bot, LV_OPA_TRANSP, EYE_W, EYE_H, 0, 0, 0);
-
-        if (s_eye_pupil[i]) {
-            lv_obj_align(s_eye_pupil[i], LV_ALIGN_CENTER, pupil_dx, 0);
-        }
-        if (s_eye[i]) {
-            lv_obj_set_style_bg_color(s_eye[i],
-                e == FACE_PANIC ? EYE_COLOR_PANIC : EYE_COLOR_NORMAL, LV_PART_MAIN);
-        }
-
-        // Geometry scales with EYE_H so expressions still carve a half-height eye
-        const int band = EYE_H / 3;         // idle top/bottom lid height
-        const int slit = 4;                 // sleep bottom slit
-        const int dome = EYE_H * 2 / 3;     // forward bottom cover height
-        const int slant_y = (EYE_H / 2) - 90;   // slant bar vertical placement
-
-        switch (e) {
-        case FACE_SURPRISE:             // full open eye
-        case FACE_LOOK_LEFT:            // full open eye, pupil shifted left
-        case FACE_LOOK_RIGHT:           // full open eye, pupil shifted right
-            break;
-        case FACE_IDLE:                 // short centred band + pupil
-            set_lid(top, LV_OPA_COVER, EYE_W, band, 0, 0, 0);
-            set_lid(bot, LV_OPA_COVER, EYE_W, band, 0, EYE_H - band, 0);
-            break;
-        case FACE_SLEEP:                // cover all but a thin bottom slit
-            set_lid(top, LV_OPA_COVER, EYE_W, EYE_H - slit, 0, 0, 0);
-            break;
-        case FACE_FORWARD:              // cover bottom -> upward dome
-            set_lid(bot, LV_OPA_COVER, EYE_W, dome, 0, EYE_H - dome, 0);
-            break;
-        case FACE_BACK:                  // eyes slant "/ \" (inner corners high)
-            set_lid(top, LV_OPA_COVER, EYE_W + 80, 90, (EYE_W - (EYE_W + 80)) / 2,
-                    slant_y, (i == 0) ? -EYE_SLANT : EYE_SLANT);
-            break;
-        case FACE_PANIC:                 // eyes slant "\ /" (inner corners low)
-            set_lid(top, LV_OPA_COVER, EYE_W + 80, 90, (EYE_W - (EYE_W + 80)) / 2,
-                    slant_y, (i == 0) ? EYE_SLANT : -EYE_SLANT);
-            break;
-        }
-    }
-
-    if (s_cue) {
-        const char *text = "";
-        switch (e) {
-        case FACE_SLEEP:      text = "z Z z"; break;
-        case FACE_LOOK_LEFT:  text = "<<";    break;
-        case FACE_LOOK_RIGHT: text = ">>";    break;
-        case FACE_BACK:       text = "REV";   break;
-        case FACE_PANIC:      text = "!!!";   break;
-        default:              text = "";      break;
-        }
-        lv_label_set_text(s_cue, text);
-        lv_obj_set_style_opa(s_cue, text[0] ? LV_OPA_COVER : LV_OPA_TRANSP, LV_PART_MAIN);
-        lv_obj_set_style_text_color(s_cue,
-            e == FACE_PANIC ? EYE_COLOR_PANIC : EYE_COLOR_NORMAL, LV_PART_MAIN);
-    }
-}
-
-static const char *face_name(face_expr_t e)
-{
-    switch (e) {
-    case FACE_SLEEP:      return "sleep";
-    case FACE_SURPRISE:   return "surprise";
-    case FACE_IDLE:       return "idle";
-    case FACE_FORWARD:    return "forward";
-    case FACE_LOOK_LEFT:  return "look_left";
-    case FACE_LOOK_RIGHT: return "look_right";
-    case FACE_BACK:       return "back";
-    case FACE_PANIC:      return "panic";
-    default:              return "?";
-    }
-}
-
-static void show_face(face_expr_t e)
-{
-    ESP_LOGI(TAG, "Expression: %s", face_name(e));
-    if (lvgl_port_lock(0)) {
-        set_face(e);
-        lvgl_port_unlock();
-    }
-}
-
 // Current lidar distance in mm, or 0 when there is no valid reading
 static uint16_t lidar_mm_now(void)
 {
@@ -596,8 +466,8 @@ static uint16_t lidar_mm_now(void)
         return 0;
     }
     uint16_t d = s_lidar_mm;
-    // Below the sensor's rated minimum range (~30mm) a "no target" condition
-    // can report noise as a small distance instead of a real close object.
+    // 0 is what the driver reports for no-target / out-of-range (range status
+    // not valid). Distances outside the long-mode window are also discarded.
     if (d == 0 || d < LIDAR_MIN_MM || d > LIDAR_MAX_MM) {
         return 0;
     }
@@ -623,6 +493,142 @@ static float mag_heading_deg(void)
     return heading;
 }
 
+// Log-scaled radius so a 30 mm hit is well away from the origin and MAP_RADIUS_MM
+// (3000 mm, half of the 6000 mm map width) lands on the canvas border.
+static float map_log_radius_px(uint16_t dist_mm, int r_max)
+{
+    float t = logf(1.0f + (float)dist_mm / (float)MAP_LOG_NEAR_MM) /
+              logf(1.0f + (float)MAP_RADIUS_MM / (float)MAP_LOG_NEAR_MM);
+    if (t > 1.0f) {
+        t = 1.0f;
+    }
+    return t * (float)r_max;
+}
+
+static int map_r_max(void)
+{
+    int r = ((s_map_w < s_map_h) ? s_map_w : s_map_h) / 2 - 1;
+    return r > 0 ? r : 0;
+}
+
+static void map_polar_xy(float bearing_deg, float radius, int *x, int *y)
+{
+    float rad = bearing_deg * (float)M_PI / 180.0f;
+    *x = s_map_w / 2 + (int)roundf(radius * sinf(rad));
+    *y = s_map_h / 2 - (int)roundf(radius * cosf(rad));
+}
+
+static void map_set_px(int x, int y, lv_color_t c)
+{
+    if (x >= 0 && x < s_map_w && y >= 0 && y < s_map_h) {
+        lv_canvas_set_px(s_map_canvas, x, y, c, LV_OPA_COVER);
+    }
+}
+
+static void map_draw_line(int x0, int y0, int x1, int y1, lv_color_t c)
+{
+    int dx = abs(x1 - x0);
+    int sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0);
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        map_set_px(x0, y0, c);
+        if (x0 == x1 && y0 == y1) {
+            break;
+        }
+        int e2 = 2 * err;
+        if (e2 >= dy) {
+            err += dy;
+            x0 += sx;
+        }
+        if (e2 <= dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+static void map_fill_circle(int cx, int cy, int r, lv_color_t c)
+{
+    for (int dy = -r; dy <= r; dy++) {
+        for (int dx = -r; dx <= r; dx++) {
+            if (dx * dx + dy * dy <= r * r) {
+                map_set_px(cx + dx, cy + dy, c);
+            }
+        }
+    }
+}
+
+// Dark N-S / E-W cross in the same polar frame as the lidar dots. Magnetic
+// north is the bottom of the screen; a red circle marks that tip.
+static void map_draw_compass(void)
+{
+    if (!s_map_canvas) {
+        return;
+    }
+    int r = map_r_max() - MAP_NORTH_R - 1;
+    if (r < 8) {
+        r = map_r_max();
+    }
+
+    lv_display_t *disp = lv_obj_get_display(s_map_canvas);
+    lv_display_enable_invalidation(disp, false);
+
+    int x0, y0, x1, y1;
+    map_polar_xy(180.0f, (float)r, &x0, &y0);
+    map_polar_xy(0.0f, (float)r, &x1, &y1);
+    map_draw_line(x0, y0, x1, y1, MAP_CROSS);
+    map_polar_xy(270.0f, (float)r, &x0, &y0);
+    map_polar_xy(90.0f, (float)r, &x1, &y1);
+    map_draw_line(x0, y0, x1, y1, MAP_CROSS);
+
+    int nx, ny;
+    map_polar_xy(180.0f, (float)r, &nx, &ny);
+    map_fill_circle(nx, ny, MAP_NORTH_R, MAP_NORTH);
+
+    lv_display_enable_invalidation(disp, true);
+    lv_obj_invalidate(s_map_canvas);
+}
+
+// Plot one lidar hit in polar coordinates. Angle is compass heading (atan2 of
+// magnetometer Y, X) plus the head look offset; radius is log(lidar mm).
+// Dots persist until the canvas is wiped every MAP_CLEAR_MS.
+static void map_plot_hit(void)
+{
+    if (!s_map_canvas) {
+        return;
+    }
+    if (!lvgl_port_lock(0)) {
+        return;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+    if ((now - s_map_cleared_ticks) >= pdMS_TO_TICKS(MAP_CLEAR_MS)) {
+        lv_canvas_fill_bg(s_map_canvas, MAP_BG, LV_OPA_COVER);
+        map_draw_compass();
+        s_map_cleared_ticks = now;
+    }
+
+    uint16_t d = lidar_mm_now();
+    if (d != 0) {
+        float heading = s_have_mag ? mag_heading_deg() : 0.0f;
+        float bearing = heading + (float)(s_look_deg - 90);
+        float rad = bearing * (float)M_PI / 180.0f;
+        int cx = s_map_w / 2;
+        int cy = s_map_h / 2;
+        int r_max = map_r_max();
+        float r = map_log_radius_px(d, r_max);
+        int x = cx + (int)roundf(r * sinf(rad));
+        int y = cy - (int)roundf(r * cosf(rad));
+        if (x >= 0 && x < s_map_w && y >= 0 && y < s_map_h) {
+            lv_canvas_set_px(s_map_canvas, x, y, MAP_DOT, LV_OPA_COVER);
+        }
+    }
+
+    lvgl_port_unlock();
+}
+
 // Shortest signed angle from `from` to `to`, in (-180, 180] degrees
 static float heading_diff_deg(float from, float to)
 {
@@ -635,6 +641,7 @@ static float heading_diff_deg(float from, float to)
 // Point both servos to an angle as a "look" gesture and reflect it on the tiles
 static void look(int angle)
 {
+    s_look_deg = angle;
     servo_set_angle(LEDC_CHANNEL_0, angle);
     servo_set_angle(LEDC_CHANNEL_1, angle);
     char buf[8];
@@ -664,7 +671,6 @@ static float measure_movement(void)
 // heading (falling back to a timeout if no magnetometer is present).
 static void turn_toward(bool go_left)
 {
-    show_face(go_left ? FACE_LOOK_LEFT : FACE_LOOK_RIGHT);
     ESP_LOGI(TAG, "Turning %s", go_left ? "left" : "right");
 
     if (go_left) {
@@ -722,14 +728,11 @@ static void behave_task(void *arg)
             // Obstacle within 10 cm: stop and look left / right
             motor_stop(MOTOR_LEFT_CH);
             motor_stop(MOTOR_RIGHT_CH);
-            show_face(FACE_PANIC);
             ESP_LOGI(TAG, "Obstacle at %u mm - scanning", d);
 
-            show_face(FACE_LOOK_LEFT);
             look(20);
             vTaskDelay(pdMS_TO_TICKS(SCAN_DWELL_MS));
             uint16_t left = lidar_mm_now();
-            show_face(FACE_LOOK_RIGHT);
             look(160);
             vTaskDelay(pdMS_TO_TICKS(SCAN_DWELL_MS));
             uint16_t right = lidar_mm_now();
@@ -742,7 +745,6 @@ static void behave_task(void *arg)
 
             if (!left_open && !right_open) {
                 // Neither side is open enough: back up and try scanning again
-                show_face(FACE_BACK);
                 ESP_LOGI(TAG, "No opening found - backing up for %d ms", BACK_MS);
                 motor_back(MOTOR_LEFT_CH);
                 motor_back(MOTOR_RIGHT_CH);
@@ -762,7 +764,6 @@ static void behave_task(void *arg)
         }
 
         // Path clear: walk forward
-        show_face(FACE_FORWARD);
         motor_fwd(MOTOR_LEFT_CH);
         motor_fwd(MOTOR_RIGHT_CH);
         ui_set_tiles("90\xC2\xB0", "90\xC2\xB0", "Fwd", "Fwd",
@@ -777,7 +778,6 @@ static void behave_task(void *arg)
         if (s_have_accel && moved < STALL_G_THRESH) {
             ESP_LOGW(TAG, "Wheels not moving (jitter %.3f g < %.3f) - stuck?",
                      moved, (float)STALL_G_THRESH);
-            show_face(FACE_PANIC);
             motor_stop(MOTOR_LEFT_CH);
             motor_stop(MOTOR_RIGHT_CH);
             ui_set_tiles("90\xC2\xB0", "90\xC2\xB0", "STUCK", "STUCK",
@@ -796,8 +796,9 @@ static void sensor_task(void *arg)
     while (1) {
         if (s_have_lidar) {
             uint16_t mm;
-            if (vl53l1x_read_mm(&s_lidar, &mm) == ESP_OK) {
-                s_lidar_mm = mm;
+            esp_err_t err = vl53l1x_read_mm(&s_lidar, &mm);
+            if (err == ESP_OK || err == ESP_ERR_NOT_FOUND) {
+                s_lidar_mm = mm;  // 0 when out of range / no target
             }
             // ESP_ERR_TIMEOUT (sample not ready yet) keeps the previous value
         }
@@ -812,9 +813,10 @@ static void sensor_task(void *arg)
         char acc_line[48];
         char mag_line[48];
 
-        if (s_have_lidar) {
+        if (s_have_lidar && s_lidar_mm != 0) {
             snprintf(lidar_line, sizeof(lidar_line), "LIDAR  %u mm", s_lidar_mm);
         } else {
+            // Missing sensor, or a valid sample with no target / out of range
             snprintf(lidar_line, sizeof(lidar_line), "LIDAR  --");
         }
         if (s_have_accel) {
@@ -836,6 +838,7 @@ static void sensor_task(void *arg)
             lv_label_set_text(s_sensor_label, buf);
             lvgl_port_unlock();
         }
+        map_plot_hit();
 
         vTaskDelay(pdMS_TO_TICKS(100));
     }
@@ -870,81 +873,41 @@ static void make_tile(lv_obj_t *parent, tile_id_t id, const char *caption,
     tile_value[id] = val;
 }
 
-// Create one eye (bright rounded rect) with a background-coloured eyelid
-// overlay that set_face() reshapes to make expressions.
-static void make_eye(lv_obj_t *parent, int idx, int x_off)
-{
-    lv_obj_t *eye = lv_obj_create(parent);
-    lv_obj_set_size(eye, EYE_W, EYE_H);
-    lv_obj_align(eye, LV_ALIGN_CENTER, x_off, -6);
-    lv_obj_set_style_bg_color(eye, lv_color_make(0x33, 0xE1, 0xFF), LV_PART_MAIN);
-    lv_obj_set_style_border_width(eye, 0, LV_PART_MAIN);
-    lv_obj_set_style_radius(eye, 10, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(eye, 0, LV_PART_MAIN);
-    lv_obj_set_style_clip_corner(eye, true, LV_PART_MAIN);
-    lv_obj_clear_flag(eye, LV_OBJ_FLAG_SCROLLABLE);
-    s_eye[idx] = eye;
-
-    // Tiny black round pupil in the middle of the eye; shifted sideways by
-    // set_face() for the look-left/look-right expressions.
-    lv_obj_t *pupil = lv_obj_create(eye);
-    lv_obj_set_size(pupil, 12, 12);
-    lv_obj_center(pupil);
-    lv_obj_set_style_bg_color(pupil, lv_color_black(), LV_PART_MAIN);
-    lv_obj_set_style_border_width(pupil, 0, LV_PART_MAIN);
-    lv_obj_set_style_radius(pupil, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(pupil, 0, LV_PART_MAIN);
-    lv_obj_clear_flag(pupil, LV_OBJ_FLAG_SCROLLABLE);
-    s_eye_pupil[idx] = pupil;
-
-    // Two eyelids (top + bottom) drawn over the pupil; reshaped by set_face()
-    for (int k = 0; k < 2; k++) {
-        lv_obj_t *lid = lv_obj_create(eye);
-        lv_obj_set_size(lid, 0, 0);
-        lv_obj_set_pos(lid, 0, 0);
-        lv_obj_set_style_bg_color(lid, FACE_BG, LV_PART_MAIN);
-        lv_obj_set_style_border_width(lid, 0, LV_PART_MAIN);
-        lv_obj_set_style_radius(lid, 8, LV_PART_MAIN);
-        lv_obj_set_style_pad_all(lid, 0, LV_PART_MAIN);
-        lv_obj_clear_flag(lid, LV_OBJ_FLAG_SCROLLABLE);
-        if (k == 0) {
-            s_eye_lid_top[idx] = lid;
-        } else {
-            s_eye_lid_bot[idx] = lid;
-        }
-    }
-}
-
 static void create_ui(void)
 {
     lv_obj_t *scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, lv_color_black(), LV_PART_MAIN);
     lv_obj_set_style_pad_all(scr, 4, LV_PART_MAIN);
 
-    // --- Top panel: robot face (two eyes), ~50% of the screen ---
+    // --- Top panel: polar lidar map, ~50% of the screen ---
     const int top_h = (LCD_V_RES - 12) / 2;
     lv_obj_t *top_panel = lv_obj_create(scr);
     lv_obj_set_size(top_panel, LCD_H_RES - 8, top_h);
     lv_obj_align(top_panel, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_bg_color(top_panel, FACE_BG, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(top_panel, MAP_BG, LV_PART_MAIN);
     lv_obj_set_style_border_width(top_panel, 0, LV_PART_MAIN);
     lv_obj_set_style_radius(top_panel, 6, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(top_panel, 6, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(top_panel, 0, LV_PART_MAIN);
     lv_obj_clear_flag(top_panel, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Two eyes spaced symmetrically around the centre
-    make_eye(top_panel, 0, -(EYE_W / 2 + 14));
-    make_eye(top_panel, 1,  (EYE_W / 2 + 14));
+    s_map_w = LCD_H_RES - 8;
+    s_map_h = top_h;
+    s_map_canvas = lv_canvas_create(top_panel);
+    lv_obj_set_size(s_map_canvas, s_map_w, s_map_h);
+    lv_obj_align(s_map_canvas, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(s_map_canvas, LV_OBJ_FLAG_SCROLLABLE);
+    s_map_buf = lv_draw_buf_create((uint32_t)s_map_w, (uint32_t)s_map_h,
+                                   LV_COLOR_FORMAT_RGB565, 0);
+    if (s_map_buf) {
+        lv_canvas_set_draw_buf(s_map_canvas, s_map_buf);
+        lv_canvas_fill_bg(s_map_canvas, MAP_BG, LV_OPA_COVER);
+        map_draw_compass();
+        s_map_cleared_ticks = xTaskGetTickCount();
+    } else {
+        ESP_LOGE(TAG, "polar map canvas buffer alloc failed");
+        s_map_canvas = NULL;
+    }
 
-    // Text cue shown/coloured per expression by set_face() ("z Z z", "<<",
-    // ">>", "REV", "!!!")
-    s_cue = lv_label_create(top_panel);
-    lv_label_set_text(s_cue, "");
-    lv_obj_set_style_text_color(s_cue, EYE_COLOR_NORMAL, LV_PART_MAIN);
-    lv_obj_align(s_cue, LV_ALIGN_TOP_RIGHT, -6, 2);
-    lv_obj_set_style_opa(s_cue, LV_OPA_TRANSP, LV_PART_MAIN);
-
-    // Tiny, dim firmware version in the corner
     const esp_app_desc_t *app_desc = esp_app_get_description();
     static char ver_buf[48];
     snprintf(ver_buf, sizeof(ver_buf), "FW: %s", app_desc->version);
@@ -992,8 +955,6 @@ static void create_ui(void)
     lv_obj_set_style_text_color(s_sensor_label, lv_color_make(0x33, 0xE1, 0xFF), LV_PART_MAIN);
     lv_obj_set_style_text_font(s_sensor_label, &lv_font_montserrat_14, LV_PART_MAIN);
     lv_obj_align(s_sensor_label, LV_ALIGN_LEFT_MID, 0, 0);
-
-    set_face(FACE_IDLE);
 }
 
 void app_main(void)
