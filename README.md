@@ -41,23 +41,25 @@ a fixed script:
              |  read lidar (mm)  |
              +-------------------+
                        |
-        distance > 200 mm? --------- no ---------+
+        distance > 100 mm? --------- no ---------+
                        | yes                     |
-              drive both wheels FWD       stop, LOOK left/right
-                       |                  (sweep servos 20/160)
-          accel jitter >= threshold?             |
-             |                 |          turn toward the
-            yes                no          more-open side,
-          keep rolling      "STUCK":       then re-check
+              drive FWD, steer          stop, back up
+              with accel Y                       |
+          accel jitter >= threshold?        spin until path
+             |                 |            ahead is open
+            yes                no
+          keep rolling      "STUCK"
                                stop
 ```
 
 - **Walk toward open space:** while the lidar reads more than `LIDAR_STOP_MM`
-  (200 mm) ahead, both wheels drive forward.
-- **Look left and right:** when something comes within 200 mm, the robot stops,
-  sweeps the servos to ~20° and ~160° while sampling the lidar, then turns in
-  place toward whichever side is more open until the path reopens past
-  `LIDAR_CLEAR_MM` (300 mm).
+  (100 mm) ahead, both wheels drive forward. Accel **Y** is low-pass filtered
+  and used as a gentle lateral error so the robot self-corrects toward a
+  straight line without chasing every bump.
+- **Back up, then turn:** when something comes within 100 mm, the robot
+  reverses for `BACK_MS`, then immediately spins in place (alternating left /
+  right each time) until the path ahead is open (`LIDAR_CLEAR_MM` / 300 mm, or
+  no target). A 12.5 s timeout is the safety cap.
 - **Wheel-motion check:** while driving forward it watches accelerometer
   "jitter"; if the wheels are commanded to move but the accel stays too still
   (below `STALL_G_THRESH`), it flags `STUCK` and stops.
@@ -199,8 +201,9 @@ and does not stop the motor demo.
 ## Polar map
 
 The top panel is a 2D occupancy sketch in polar coordinates. The robot sits at
-the centre (not drawn). About ten times a second the firmware plots **one
-pixel**:
+the centre (not drawn). Every 100 ms the firmware pushes one lidar sample into
+a **FIFO of 200 hits** (~20 s of history) and redraws the cloud, so old dots
+scroll off as new ones arrive:
 
 - **Angle:** magnetometer heading, `atan2(MAG_Y, MAG_X)`, plus the current servo
   look offset (90° is forward, toward the top of the screen).
@@ -208,9 +211,9 @@ pixel**:
   canvas is 6000 mm across; 3000 mm (lidar long-mode neighbourhood) reaches the
   border.
 
-Pixels stay until the canvas is cleared every 10 seconds. Behind the dots is a
-dark **+** compass: one line is north–south, the other east–west. Magnetic north
-is the bottom of the map, marked with a small **red circle** on that tip.
+Behind the dots is a dark **+** compass: one line is north–south, the other
+east–west. Magnetic north is the bottom of the map, marked with a small **red
+circle** on that tip.
 
 ## Firmware behaviour
 

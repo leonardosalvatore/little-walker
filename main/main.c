@@ -41,22 +41,29 @@ static const char *TAG = "main";
 #define MOTOR_LEFT_CH   1     // Motoron motor channel 1
 #define MOTOR_RIGHT_CH  2     // Motoron motor channel 2
 #define MOTOR_SPEED     400   // 0..800 (half power for a gentle demo)
+// Wheels are mounted opposite each other: +speed on both would spin in place.
+// Right motor is inverted so "forward" on both channels is straight ahead.
+#define MOTOR_LEFT_POLARITY   1
+#define MOTOR_RIGHT_POLARITY -1
+#define STRAIGHT_Y_GAIN  180   // motor units per g of lateral (Y) accel (keep gentle)
+#define STRAIGHT_Y_DEAD  0.08f // ignore small Y noise / bumps
+#define STRAIGHT_Y_LP    0.12f // EMA blend toward new Y (lower = slower / less twitchy)
+#define MOTOR_SPEED_MIN  80
+#define MOTOR_SPEED_MAX  800
 
 // Reactive-behaviour tuning
 #define LIDAR_STOP_MM   100   // obstacle distance that halts forward driving (10 cm)
-#define LIDAR_OPEN_MM   200   // a scanned side must be more open than this to turn that way (20 cm)
 #define LIDAR_CLEAR_MM  300   // path ahead must reopen past this before resuming forward
 #define LIDAR_MAX_MM    3600  // VL53L1X long-mode max (Adafruit/ST: 360 cm)
 #define LIDAR_MIN_MM    30    // below ~30 mm is below the sensor's rated floor
 #define STALL_G_THRESH  0.04f // min accel jitter (g) expected while rolling
-#define TURN_TARGET_DEG 40.0f // compass heading change that completes one turn attempt
-#define TURN_TIMEOUT_MS 12500 // safety cap in case the heading doesn't move
-#define BACK_MS         3000  // reverse duration when neither side is open
-#define SCAN_DWELL_MS   2500  // how long to hold each look-left/look-right pose
+#define TURN_TIMEOUT_MS 12500 // safety cap if no opening appears while spinning
+#define BACK_MS         3000  // reverse duration after hitting a 100 mm obstacle
 #define MAP_WIDTH_MM    6000  // canvas width in millimetres (centre to edge = 3000 mm)
 #define MAP_RADIUS_MM   (MAP_WIDTH_MM / 2)
 #define MAP_LOG_NEAR_MM 30    // log floor so nearby lidar hits are not crushed to the origin
-#define MAP_CLEAR_MS    10000 // wipe the accumulated dots after this many ms
+#define MAP_FIFO_LEN    200   // sliding window of lidar hits (~20 s at 100 ms)
+#define MAP_SAMPLE_MS   100   // how often a hit is pushed into the FIFO / map
 
 // Servo PWM parameters (50 Hz, 14-bit resolution)
 #define SERVO_FREQ_HZ       50
@@ -283,6 +290,11 @@ static void motoron_init(void)
 // Set Speed (now mode): speed is -800..800, encoded as 14-bit two's complement
 static void motoron_set_speed(uint8_t motor, int16_t speed)
 {
+    if (motor == MOTOR_LEFT_CH) {
+        speed = (int16_t)(speed * MOTOR_LEFT_POLARITY);
+    } else if (motor == MOTOR_RIGHT_CH) {
+        speed = (int16_t)(speed * MOTOR_RIGHT_POLARITY);
+    }
     uint8_t cmd[4] = {
         0xD2,
         (uint8_t)(motor & 0x7F),
@@ -292,9 +304,20 @@ static void motoron_set_speed(uint8_t motor, int16_t speed)
     motoron_send(cmd, sizeof(cmd));
 }
 
+static inline int16_t clamp_motor_speed(int v)
+{
+    if (v > MOTOR_SPEED_MAX) {
+        return MOTOR_SPEED_MAX;
+    }
+    if (v < MOTOR_SPEED_MIN) {
+        return MOTOR_SPEED_MIN;
+    }
+    return (int16_t)v;
+}
+
 static inline void motor_fwd(uint8_t motor)  { motoron_set_speed(motor, MOTOR_SPEED); }
 static inline void motor_stop(uint8_t motor) { motoron_set_speed(motor, 0); }
-static inline void motor_back(uint8_t motor) { motoron_set_speed(motor, -MOTOR_SPEED); }
+static inline void motor_back(uint8_t motor) { motoron_set_speed(motor, (int16_t)(-MOTOR_SPEED)); }
 
 // --- Qwiic sensors: LSM303AGR (accel + mag) and VL53L1X (lidar) ---
 static i2c_master_dev_handle_t s_lsm_acc = NULL;
@@ -310,6 +333,27 @@ static uint16_t s_lidar_mm = 0;
 static int s_look_deg = 90;   // current head angle (90 = forward)
 static float s_acc_g[3] = {0};
 static float s_mag_ut[3] = {0};
+static float s_y_filt = 0.0f;
+static bool s_next_turn_left = true;
+
+// Drive forward while steering with accel Y: +Y (leftward) means we are
+// veering left, so speed up the left wheel / slow the right. Y is low-pass
+// filtered so bumps and vibration do not yank the wheels.
+static void motor_drive_straight(void)
+{
+    int left = MOTOR_SPEED;
+    int right = MOTOR_SPEED;
+    if (s_have_accel) {
+        s_y_filt += STRAIGHT_Y_LP * (s_acc_g[1] - s_y_filt);
+        if (fabsf(s_y_filt) > STRAIGHT_Y_DEAD) {
+            int corr = (int)(s_y_filt * (float)STRAIGHT_Y_GAIN);
+            left += corr;
+            right -= corr;
+        }
+    }
+    motoron_set_speed(MOTOR_LEFT_CH, clamp_motor_speed(left));
+    motoron_set_speed(MOTOR_RIGHT_CH, clamp_motor_speed(right));
+}
 
 static esp_err_t lsm_write8(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t val)
 {
@@ -419,7 +463,15 @@ static lv_obj_t *s_map_canvas = NULL;
 static lv_draw_buf_t *s_map_buf = NULL;
 static int s_map_w = 0;
 static int s_map_h = 0;
-static TickType_t s_map_cleared_ticks = 0;
+
+typedef struct {
+    uint16_t mm;
+    float bearing_deg;
+} map_hit_t;
+
+static map_hit_t s_map_fifo[MAP_FIFO_LEN];
+static uint16_t s_map_fifo_head = 0;   // next write index
+static uint16_t s_map_fifo_count = 0;
 
 #define MAP_BG    lv_color_make(0x05, 0x07, 0x0D)
 #define MAP_DOT   lv_color_make(0x33, 0xE1, 0xFF)
@@ -591,10 +643,30 @@ static void map_draw_compass(void)
     lv_obj_invalidate(s_map_canvas);
 }
 
-// Plot one lidar hit in polar coordinates. Angle is compass heading (atan2 of
-// magnetometer Y, X) plus the head look offset; radius is log(lidar mm).
-// Dots persist until the canvas is wiped every MAP_CLEAR_MS.
-static void map_plot_hit(void)
+static void map_fifo_push(uint16_t mm, float bearing_deg)
+{
+    s_map_fifo[s_map_fifo_head].mm = mm;
+    s_map_fifo[s_map_fifo_head].bearing_deg = bearing_deg;
+    s_map_fifo_head = (uint16_t)((s_map_fifo_head + 1) % MAP_FIFO_LEN);
+    if (s_map_fifo_count < MAP_FIFO_LEN) {
+        s_map_fifo_count++;
+    }
+}
+
+static void map_plot_sample(uint16_t mm, float bearing_deg)
+{
+    if (mm == 0) {
+        return;
+    }
+    int r_max = map_r_max();
+    float r = map_log_radius_px(mm, r_max);
+    int x, y;
+    map_polar_xy(bearing_deg, r, &x, &y);
+    map_set_px(x, y, MAP_DOT);
+}
+
+// Redraw the last MAP_FIFO_LEN hits so the cloud scrolls as old samples drop off.
+static void map_redraw(void)
 {
     if (!s_map_canvas) {
         return;
@@ -603,28 +675,19 @@ static void map_plot_hit(void)
         return;
     }
 
-    TickType_t now = xTaskGetTickCount();
-    if ((now - s_map_cleared_ticks) >= pdMS_TO_TICKS(MAP_CLEAR_MS)) {
-        lv_canvas_fill_bg(s_map_canvas, MAP_BG, LV_OPA_COVER);
-        map_draw_compass();
-        s_map_cleared_ticks = now;
+    lv_display_t *disp = lv_obj_get_display(s_map_canvas);
+    lv_display_enable_invalidation(disp, false);
+
+    lv_canvas_fill_bg(s_map_canvas, MAP_BG, LV_OPA_COVER);
+
+    uint16_t start = (uint16_t)((s_map_fifo_head + MAP_FIFO_LEN - s_map_fifo_count) % MAP_FIFO_LEN);
+    for (uint16_t i = 0; i < s_map_fifo_count; i++) {
+        map_hit_t *h = &s_map_fifo[(start + i) % MAP_FIFO_LEN];
+        map_plot_sample(h->mm, h->bearing_deg);
     }
 
-    uint16_t d = lidar_mm_now();
-    if (d != 0) {
-        float heading = s_have_mag ? mag_heading_deg() : 0.0f;
-        float bearing = heading + (float)(s_look_deg - 90);
-        float rad = bearing * (float)M_PI / 180.0f;
-        int cx = s_map_w / 2;
-        int cy = s_map_h / 2;
-        int r_max = map_r_max();
-        float r = map_log_radius_px(d, r_max);
-        int x = cx + (int)roundf(r * sinf(rad));
-        int y = cy - (int)roundf(r * cosf(rad));
-        if (x >= 0 && x < s_map_w && y >= 0 && y < s_map_h) {
-            lv_canvas_set_px(s_map_canvas, x, y, MAP_DOT, LV_OPA_COVER);
-        }
-    }
+    lv_display_enable_invalidation(disp, true);
+    map_draw_compass();
 
     lvgl_port_unlock();
 }
@@ -649,29 +712,35 @@ static void look(int angle)
     ui_set_tiles(buf, buf, "--", "--", true, true, false, false);
 }
 
-// Accumulate accel "jitter" over ~600 ms. While the robot is really rolling this
-// picks up vibration/tilt; near-zero while driving means the wheels are stuck.
+// Accumulate accel "jitter" over ~600 ms, aborting if something comes within
+// LIDAR_STOP_MM so we do not roll closer than 100 mm.
 static float measure_movement(void)
 {
-    if (!s_have_accel) {
-        return 1.0f;   // no accelerometer -> assume motion is fine
-    }
-    float prev = accel_mag();
+    float prev = s_have_accel ? accel_mag() : 1.0f;
     float total = 0.0f;
     for (int i = 0; i < 6; i++) {
         vTaskDelay(pdMS_TO_TICKS(100));
-        float m = accel_mag();
-        total += fabsf(m - prev);
-        prev = m;
+        uint16_t d = lidar_mm_now();
+        if (d != 0 && d <= LIDAR_STOP_MM) {
+            motor_stop(MOTOR_LEFT_CH);
+            motor_stop(MOTOR_RIGHT_CH);
+            return 1.0f;  // obstacle handled by the caller; not a stall
+        }
+        motor_drive_straight();
+        if (s_have_accel) {
+            float m = accel_mag();
+            total += fabsf(m - prev);
+            prev = m;
+        }
     }
-    return total;
+    return s_have_accel ? total : 1.0f;
 }
 
-// Turn in place toward `go_left`, tracking actual rotation via the compass
-// heading (falling back to a timeout if no magnetometer is present).
+// Turn in place toward `go_left` until the lidar ahead is open (out of range
+// or past LIDAR_CLEAR_MM). Compass heading is logged; timeout is the safety cap.
 static void turn_toward(bool go_left)
 {
-    ESP_LOGI(TAG, "Turning %s", go_left ? "left" : "right");
+    ESP_LOGI(TAG, "Turning %s until path opens", go_left ? "left" : "right");
 
     if (go_left) {
         motor_back(MOTOR_LEFT_CH);
@@ -689,18 +758,11 @@ static void turn_toward(bool go_left)
     TickType_t t0 = xTaskGetTickCount();
     const char *stop_reason = "timeout";
     while ((xTaskGetTickCount() - t0) < pdMS_TO_TICKS(TURN_TIMEOUT_MS)) {
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(250));
         uint16_t dd = lidar_mm_now();
         if (dd == 0 || dd >= LIDAR_CLEAR_MM) {
             stop_reason = "path reopened";
-            break;   // path ahead reopened
-        }
-        if (s_have_mag) {
-            float turned = heading_diff_deg(start_heading, mag_heading_deg());
-            if (fabsf(turned) >= TURN_TARGET_DEG) {
-                stop_reason = "compass target reached";
-                break;
-            }
+            break;
         }
     }
     motor_stop(MOTOR_LEFT_CH);
@@ -712,11 +774,9 @@ static void turn_toward(bool go_left)
              go_left ? "left" : "right", stop_reason, turned, (unsigned int)elapsed_ms);
 }
 
-// Reactive behaviour: drive forward while the path is clear (> 10 cm); when an
-// obstacle is closer, look left/right and turn toward whichever side is more
-// open (> 20 cm), confirming the turn with the compass. If neither side is
-// open enough, back up and scan again. The accelerometer confirms the wheels
-// are actually moving while driving forward.
+// Reactive behaviour: drive forward while the path is clear (> 10 cm). On an
+// obstacle, back up, then immediately spin until the path ahead opens. Accel Y
+// steers gently to keep the robot going straight.
 static void behave_task(void *arg)
 {
     look(90);   // center the head
@@ -725,47 +785,27 @@ static void behave_task(void *arg)
         uint16_t d = lidar_mm_now();
 
         if (d != 0 && d <= LIDAR_STOP_MM) {
-            // Obstacle within 10 cm: stop and look left / right
             motor_stop(MOTOR_LEFT_CH);
             motor_stop(MOTOR_RIGHT_CH);
-            ESP_LOGI(TAG, "Obstacle at %u mm - scanning", d);
+            ESP_LOGI(TAG, "Obstacle at %u mm - backing up then turning", d);
 
-            look(20);
-            vTaskDelay(pdMS_TO_TICKS(SCAN_DWELL_MS));
-            uint16_t left = lidar_mm_now();
-            look(160);
-            vTaskDelay(pdMS_TO_TICKS(SCAN_DWELL_MS));
-            uint16_t right = lidar_mm_now();
-            look(90);
+            motor_back(MOTOR_LEFT_CH);
+            motor_back(MOTOR_RIGHT_CH);
+            ui_set_tiles("90\xC2\xB0", "90\xC2\xB0", "Rev", "Rev",
+                         false, false, true, true);
+            vTaskDelay(pdMS_TO_TICKS(BACK_MS));
 
-            bool left_open = (left == 0 || left >= LIDAR_OPEN_MM);
-            bool right_open = (right == 0 || right >= LIDAR_OPEN_MM);
-            ESP_LOGI(TAG, "Scan L=%u R=%u (open L=%d R=%d)",
-                     left, right, left_open, right_open);
-
-            if (!left_open && !right_open) {
-                // Neither side is open enough: back up and try scanning again
-                ESP_LOGI(TAG, "No opening found - backing up for %d ms", BACK_MS);
-                motor_back(MOTOR_LEFT_CH);
-                motor_back(MOTOR_RIGHT_CH);
-                ui_set_tiles("90\xC2\xB0", "90\xC2\xB0", "Rev", "Rev",
-                             false, false, true, true);
-                vTaskDelay(pdMS_TO_TICKS(BACK_MS));
-                motor_stop(MOTOR_LEFT_CH);
-                motor_stop(MOTOR_RIGHT_CH);
-                ESP_LOGI(TAG, "Back up done - rescanning");
-                continue;
-            }
-
-            // Turn toward whichever side is open (prefer the more open one)
-            bool go_left = left_open && (!right_open || left >= right);
+            // Spin in place until the lidar (still looking forward) finds an opening.
+            bool go_left = s_next_turn_left;
+            s_next_turn_left = !s_next_turn_left;
+            ESP_LOGI(TAG, "Backup done - turning %s to find a path",
+                     go_left ? "left" : "right");
             turn_toward(go_left);
             continue;
         }
 
-        // Path clear: walk forward
-        motor_fwd(MOTOR_LEFT_CH);
-        motor_fwd(MOTOR_RIGHT_CH);
+        // Path clear: walk forward, steering with accel Y
+        motor_drive_straight();
         ui_set_tiles("90\xC2\xB0", "90\xC2\xB0", "Fwd", "Fwd",
                      false, false, true, true);
 
@@ -789,10 +829,11 @@ static void behave_task(void *arg)
     }
 }
 
-// Poll the Qwiic sensors and refresh the readout strip (~10 Hz)
+// Poll the Qwiic sensors (~10 Hz) and push a lidar hit into the map FIFO at 100 ms
 static void sensor_task(void *arg)
 {
     char buf[128];
+    TickType_t last_map = 0;
     while (1) {
         if (s_have_lidar) {
             uint16_t mm;
@@ -838,7 +879,15 @@ static void sensor_task(void *arg)
             lv_label_set_text(s_sensor_label, buf);
             lvgl_port_unlock();
         }
-        map_plot_hit();
+
+        TickType_t now = xTaskGetTickCount();
+        if ((now - last_map) >= pdMS_TO_TICKS(MAP_SAMPLE_MS)) {
+            float heading = s_have_mag ? mag_heading_deg() : 0.0f;
+            float bearing = heading + (float)(s_look_deg - 90);
+            map_fifo_push(lidar_mm_now(), bearing);
+            map_redraw();
+            last_map = now;
+        }
 
         vTaskDelay(pdMS_TO_TICKS(100));
     }
@@ -902,7 +951,6 @@ static void create_ui(void)
         lv_canvas_set_draw_buf(s_map_canvas, s_map_buf);
         lv_canvas_fill_bg(s_map_canvas, MAP_BG, LV_OPA_COVER);
         map_draw_compass();
-        s_map_cleared_ticks = xTaskGetTickCount();
     } else {
         ESP_LOGE(TAG, "polar map canvas buffer alloc failed");
         s_map_canvas = NULL;
