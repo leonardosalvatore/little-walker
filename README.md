@@ -5,7 +5,7 @@ ESP32-C6 firmware for a small two-wheeled robot. It drives **two DC motors**
 servos** (on-chip LEDC/PWM), reacts to a **VL53L1X** lidar and an **LSM303AGR**
 accelerometer/magnetometer, and shows live status on the on-board 1.47" LCD.
 
-![Little Walker build: ESP32-C6-LCD-1.47 and Motoron M3T453 on a perfboard chassis between two geared wheels, the LCD showing the robot face](assets/little-walker-build.png)
+[![Little Walker build video](https://img.youtube.com/vi/KLnIXzM8GTo/hqdefault.jpg)](https://www.youtube.com/shorts/KLnIXzM8GTo)
 
 The build above uses:
 
